@@ -20,7 +20,7 @@ if __package__:
         MoonrakerError,
         parse_origin,
     )
-    from .safety import plugin_data_dir, request_motion_approval, write_guard_error
+    from .safety import in_plugin_host_process, plugin_data_dir, request_motion_approval, write_guard_error
     from . import watch as watch_state
 else:
     from client import (
@@ -31,7 +31,7 @@ else:
         MoonrakerError,
         parse_origin,
     )
-    from safety import plugin_data_dir, request_motion_approval, write_guard_error
+    from safety import in_plugin_host_process, plugin_data_dir, request_motion_approval, write_guard_error
     import watch as watch_state
 
 TOOLSET = "klipper_print_watch"
@@ -578,6 +578,15 @@ def _failure_record(deps: Deps) -> tuple[Path | None, dict | None, bool]:
     return path, raw, False
 
 
+def _failure_file_mark(path: Path) -> str | None:
+    """Identity of this file. Delete-and-rewrite is a new file even when the bytes match."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
+
+
 def _is_cron_turn() -> bool:
     """True only when Hermes says this turn is cron. A missing helper does not count as cron."""
     try:
@@ -669,7 +678,7 @@ def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
         body["notify"] = True
         body["message"] = "klipper_watch was called with arguments, so the printer was not checked. " + body["message"]
         return dumps(body)
-    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+    if in_plugin_host_process():
         return fail(
             "plugin_host",
             "plugins.isolation is host, so this process cannot see Hermes's cron mark. "
@@ -706,14 +715,17 @@ def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
     new_state, events, note = watch_state.compare(prev, sample, deps.now(), deps.stall_minutes)
     unreadable_note = None
     failure_path, _record, unreadable = _failure_record(deps)
-    if unreadable:
-        if not (prev or {}).get("failure_record_unreadable_reported"):
+    if unreadable and failure_path is not None:
+        # The mark is this file's identity. A missing file is not written back, so the
+        # mark is cleared. The same bytes in a new file are reported once more.
+        mark = _failure_file_mark(failure_path)
+        if mark and mark != (prev or {}).get("failure_record_unreadable_mark"):
             unreadable_note = (
                 f"The failure record {FAILURE_FILE} is unreadable and was left as it is. "
                 f"Delete {failure_path} so later outages are counted again; until then every failed check reports."
             )
-        if advance:
-            new_state["failure_record_unreadable_reported"] = True
+        if advance and mark:
+            new_state["failure_record_unreadable_mark"] = mark
     write_error = _write_watch(deps, path, new_state) if advance else None
     vision = {"enabled": False, "calls": 0, "moved_printer": False}
     snapshot = None
@@ -936,7 +948,7 @@ def _cron(deps: Deps):
 _SCHEDULE_WORDS = {
     "every", "in", "at", "on", "daily", "hourly", "weekly", "monthly", "yearly", "annually",
     "once", "now", "today", "tonight", "tomorrow", "midnight", "noon", "minute", "minutes", "hour", "hours",
-    "day", "days", "week", "weeks",
+    "day", "days", "week", "weeks", "weekday", "weekdays", "weekend", "weekends",
 }
 _WEEKDAYS = {
     "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
@@ -1027,7 +1039,7 @@ def slash_schedule_args(parts: list[str], default: str = DEFAULT_SCHEDULE) -> tu
 
 
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
-    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+    if in_plugin_host_process():
         return fail(
             "plugin_host",
             "plugins.isolation is host, so this process cannot see Hermes's cron mark. No cron job was created.",

@@ -407,16 +407,16 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path):
     jobs = Jobs()
     missing = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "*/5 * * * *", ""))
     assert missing["ok"] is False and jobs.created == []
-    for expr in ("* * * * *", "1m", "every 1m", "0-59 * * * *", "* * * * * *", "0 * * * * *"):
+    for expr in ("* * * * *", "1m", "every 1m", "0-59 * * * *", "* * * * * *", "0 * * * * *", "every 30s", "every monday 9am"):
         fast = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), expr, "local"))
-        assert fast["ok"] is False, expr
+        assert fast["ok"] is False and fast["error"] == "schedule_too_fast", expr
     assert jobs.created == []
     made = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "*/5 * * * *", "local"))
     assert made["ok"] is True
     assert jobs.created[0]["enabled_toolsets"] == ["klipper_print_watch"]
     assert "Do not call klipper_control" in jobs.created[0]["prompt"]
     assert "not sent to a chat" in made["message"]
-    for expr in ("2m", "every 2m", "*/2 * * * *", "0 0 * * * *"):
+    for expr in ("2m", "every 2m", "every 5m", "in 30m", "*/2 * * * *", "0 0 * * * *"):
         slow = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), expr, "telegram"))
         assert slow["ok"] is True, expr
         assert "does not check that the chat exists" in slow["message"]
@@ -717,14 +717,20 @@ def test_approval_text_names_the_printer_the_call_and_the_argument(tmp_path, mon
 
 
 def test_plugin_host_process_refuses_motion_before_asking_or_http(tmp_path, monkeypatch):
+    for value in ("1", "true"):
+        hermes = _FakeHermes("once")
+        hermes.install(monkeypatch)
+        monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", value)
+        router = _moving_router()
+        out = json.loads(control(deps(tmp_path, router, approver=None), {"action": "cancel"}))
+        assert out["moved"] is False
+        assert out["message"].startswith("BLOCKED:") and "plugins.isolation: host" in out["message"]
+        assert hermes.asked == [] and router.calls == []
     hermes = _FakeHermes("once")
     hermes.install(monkeypatch)
-    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
-    router = _moving_router()
-    out = json.loads(control(deps(tmp_path, router, approver=None), {"action": "cancel"}))
-    assert out["moved"] is False
-    assert out["message"].startswith("BLOCKED:") and "plugins.isolation: host" in out["message"]
-    assert hermes.asked == [] and router.calls == []
+    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "0")
+    out = json.loads(control(deps(tmp_path, _moving_router(), approver=None), {"action": "pause"}))
+    assert out["moved"] is True and hermes.asked
 
 
 def test_unreachable_printer_notifies_once_then_stays_quiet_then_says_it_is_back(tmp_path):
@@ -862,6 +868,21 @@ def test_unreadable_failure_record_is_reported_and_left_in_place(tmp_path):
     assert ok["notify"] is True and "unreadable" in ok["message"]
     assert json.loads(watch(dep, {}))["notify"] is False
     assert path.read_text(encoding="utf-8") == "{not json"
+    path.unlink()
+    path.write_text("{not json", encoding="utf-8")
+    replaced = json.loads(watch(dep, {}))
+    assert replaced["notify"] is True
+    assert "unreadable" in replaced["message"].lower() and "delete" in replaced["message"].lower()
+    assert path.read_text(encoding="utf-8") == "{not json"
+    assert json.loads(watch(dep, {}))["notify"] is False
+    path.unlink()
+    cleared = json.loads(watch(dep, {}))
+    assert cleared["notify"] is False
+    stored = json.loads((tmp_path / "watch_state.json").read_text(encoding="utf-8"))
+    assert "failure_record_unreadable_mark" not in stored
+    path.write_text("{not json", encoding="utf-8")
+    assert json.loads(watch(dep, {}))["notify"] is True
+    assert path.read_text(encoding="utf-8") == "{not json"
 
 
 def test_a_new_failure_cause_is_reported_again(tmp_path):
@@ -918,7 +939,7 @@ class _KeptJobs:
         self.jobs = [job for job in self.jobs if job["id"] != job_id]
 
 
-@pytest.mark.parametrize("line", ["schedule every 5m", "schedule 5m", "schedule in 30m"])
+@pytest.mark.parametrize("line", ["schedule every 5m", "schedule 5m", "schedule in 30m", "schedule weekdays", "schedule weekends"])
 def test_slash_schedule_refuses_a_schedule_word_as_the_deliver_target(tmp_path, line):
     jobs = _KeptJobs()
     when, deliver = slash_schedule_args(line.split())
@@ -1064,15 +1085,43 @@ def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7
 
 def test_plugin_host_watch_does_not_report_the_printer_unchanged(tmp_path, monkeypatch):
     router = Router()
-    ctx, _service_mod = _load_handlers(tmp_path, router, monkeypatch)
-    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
-    body = json.loads(ctx.tools["klipper_watch"]({}))
-    assert body["ok"] is False
-    assert body["error"] == "plugin_host"
-    assert "unchanged" in body["message"]
-    assert "cron mark" in body["message"]
-    assert not (tmp_path / "watch_state.json").exists()
+    ctx, service_mod = _load_handlers(tmp_path, router, monkeypatch)
+
+    class Jobs:
+        def __init__(self):
+            self.created = []
+
+        def list_jobs(self, include_disabled=True):
+            return []
+
+        def create_job(self, **kwargs):
+            self.created.append(kwargs)
+            return {"id": "job", "schedule_display": kwargs["schedule"]}
+
+    for value in ("1", "true"):
+        monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", value)
+        body = json.loads(ctx.tools["klipper_watch"]({}))
+        assert body["ok"] is False and body["notify"] is True and body["error"] == "plugin_host"
+        assert "unchanged" in body["message"] and "No new event" not in body["message"]
+        assert "cron mark" in body["message"]
+        assert not (tmp_path / "watch_state.json").exists()
+        jobs = Jobs()
+        scheduled = json.loads(service_mod.schedule(
+            service_mod.Deps(url="http://printer.local:7125", data_dir=tmp_path, cron_module=jobs),
+            "*/5 * * * *",
+            "local",
+        ))
+        assert scheduled["ok"] is False and scheduled["error"] == "plugin_host"
+        assert jobs.created == []
     assert router.calls == []
+    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "0")
+    jobs = Jobs()
+    allowed = json.loads(service_mod.schedule(
+        service_mod.Deps(url="http://printer.local:7125", data_dir=tmp_path, cron_module=jobs),
+        "*/5 * * * *",
+        "local",
+    ))
+    assert allowed["ok"] is True and len(jobs.created) == 1
 
 
 def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
