@@ -1,0 +1,68 @@
+name: klipper-print-watch
+version: 0.1.0
+manifest_version: 2
+requires_hermes: ">=0.21.4"
+description: >-
+  Watch a Klipper printer from Hermes, built on the Moonraker HTTP API.
+  Read print state, progress, temperatures and a slicer time estimate.
+  Save a webcam still only after Hermes's write guard allows the path
+  and the download is complete and within the size cap. A short or
+  oversized body is discarded.
+  Pause, resume or cancel only after a person approves through Hermes
+  and print_stats.state then changes. If it is already that state,
+  nothing is sent. Every move asks again; a session or always answer is
+  not reused. Moves are refused under plugins.isolation host.
+  A cron watch can report klippy_shutdown (Klipper itself stopped, printing
+  or not), complete, error, paused (only when the previous state was
+  printing and Klipper is running), cancelled, and stalled. An unreachable
+  printer is reported once. Each cron run is one Hermes agent turn on your
+  model (288 a day every 5 minutes).
+  The watch does not move the printer. Camera failure checks are off unless you
+  enable them, and even then they do not cancel the print.
+author: TakeshiTGAL
+license: MIT
+homepage: https://github.com/TakeshiTGAL/hermes-plugin-klipper-print-watch
+tags: [klipper, moonraker, printer, cron]
+provides_tools:
+  - klipper_status
+  - klipper_control
+  - klipper_watch
+requires_env:
+  - name: MOONRAKER_URL
+    description: "Single Moonraker base URL, for example http://printer.example:7125. No path, query, or userinfo."
+    prompt: "Moonraker base URL"
+    secret: false
+    password: false
+optional_env:
+  - name: MOONRAKER_API_KEY
+    description: "API key for an untrusted client. Sent only as the X-Api-Key header. Leave empty when this machine is in Moonraker trusted_clients."
+    prompt: "Moonraker API key (or empty if this host is trusted)"
+    secret: true
+    password: true
+config_schema:
+  stall_minutes:
+    type: int
+    default: 10
+    label: Minutes before a stall
+    description: >-
+      While print_stats.state is printing, a watch tick reports a stall only
+      when file_position is a number and the file position, progress, and
+      filename have all stayed the same for this many minutes. A missing
+      file_position is not a stall. Clamped to 1-240. Tool arguments cannot
+      change it.
+  vision_check:
+    type: bool
+    default: false
+    label: Ask your model if a still looks failed
+    description: >-
+      Off by default. When true, each klipper_watch tick saves one webcam still
+      and makes one ctx.llm image call. A "looks failed" answer does not pause
+      or cancel. The printer moves only through klipper_control after approval.
+  snapshot_max_bytes:
+    type: int
+    default: 2000000
+    label: Largest webcam still to keep
+    description: >-
+      Bytes. Clamped to 1-5000000. A larger download (or a larger declared
+      Content-Length), or one shorter than Content-Length, is discarded and not
+      saved. Tool arguments cannot raise it.
