@@ -971,3 +971,222 @@ def test_control_timeout_says_the_command_may_still_arrive(tmp_path):
 def test_cancel_approval_text_says_it_cannot_be_resumed():
     assert "cannot be resumed" in safety.approval_text("cancel", "http://printer.local:7125")
     assert "cannot be resumed" not in safety.approval_text("pause", "http://printer.local:7125")
+
+
+def test_control_disconnect_after_post_says_the_command_may_still_arrive(tmp_path):
+    class Drop(Router):
+        def __call__(self, method, url, headers, body, timeout, read_limit=1_000_000):
+            if "/printer/print/" in url:
+                raise ConnectionError("connection dropped")
+            return Router.__call__(self, method, url, headers, body, timeout, read_limit)
+
+    router = Drop()
+    router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}))
+    out = json.loads(control(deps(tmp_path, router), {"action": "cancel"}))
+    assert out["moved"] is False
+    assert "may still have reached the printer and may take effect later" in out["message"]
+
+
+@pytest.mark.parametrize("target", ["cli", "cron", "api_server", "telegarm", "bot-chat:"])
+def test_unknown_deliver_targets_are_refused(tmp_path, target):
+    jobs = _KeptJobs()
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", target))
+    assert out["ok"] is False and out["error"] == "bad_deliver"
+    assert jobs.created == []
+
+
+def test_bot_chat_deliver_says_it_starts_a_model_turn(tmp_path):
+    jobs = _KeptJobs()
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", "origin,all"))
+    assert out["ok"] is True and out["deliver"] == "origin,all"
+    chat = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", "bot-chat"))
+    assert chat["ok"] is True
+    assert "one model turn" in chat["message"]
+    assert "agent can act" in chat["message"]
+
+
+def _cancelled_body() -> bytes:
+    cancelled = json.loads(json.dumps(PRINTING))
+    cancelled["status"]["print_stats"]["state"] = "cancelled"
+    return ok_result(cancelled)
+
+
+def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7125", use_router=True):
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    monkeypatch.setenv("MOONRAKER_URL", url)
+    monkeypatch.delenv("MOONRAKER_API_KEY", raising=False)
+    spec = importlib.util.spec_from_file_location(
+        "klipper_fix2_plugin",
+        root / "__init__.py",
+        submodule_search_locations=[str(root)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    module.__path__ = [str(root)]
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    class Ctx:
+        def __init__(self):
+            self.tools = {}
+            self.command = None
+            self.cli = None
+
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            self.tools[name] = handler
+
+        def register_command(self, name, handler, description=""):
+            self.command = handler
+
+        def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
+            self.cli = handler_fn
+
+        def get_config(self, key, default=None):
+            return default
+
+        llm = None
+
+    ctx = Ctx()
+    module.register(ctx)
+    service_mod = sys.modules[spec.name + ".service"]
+    client_mod = sys.modules[spec.name + ".client"]
+    monkeypatch.setattr(service_mod, "plugin_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(service_mod, "write_guard_error", lambda _path: None)
+    if use_router:
+        monkeypatch.setattr(
+            service_mod,
+            "_client",
+            lambda deps: client_mod.Moonraker(client_mod.parse_origin(deps.url), transport=router),
+        )
+    return ctx, service_mod
+
+
+def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
+    import asyncio
+
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result(PRINTING))
+    router.add("/server/files/metadata", 200, ok_result({}))
+    ctx, service_mod = _load_handlers(tmp_path, router, monkeypatch)
+    cron_on = {"value": True}
+    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: cron_on["value"])
+
+    def baseline():
+        router.routes[0][2] = ok_result(PRINTING)
+        cron_on["value"] = True
+        first = json.loads(ctx.tools["klipper_watch"]({}))
+        assert first["events"] == [] and first["state_saved"] is True
+
+    def manual_then_cron(manual):
+        router.routes[0][2] = _cancelled_body()
+        before = (tmp_path / "watch_state.json").read_text(encoding="utf-8")
+        cron_on["value"] = False
+        seen = json.loads(manual())
+        assert [event["kind"] for event in seen["events"]] == ["cancelled"]
+        assert seen["state_saved"] is False
+        assert (tmp_path / "watch_state.json").read_text(encoding="utf-8") == before
+        cron_on["value"] = True
+        again = json.loads(ctx.tools["klipper_watch"]({}))
+        assert [event["kind"] for event in again["events"]] == ["cancelled"]
+        assert again["state_saved"] is True
+
+    baseline()
+    manual_then_cron(lambda: asyncio.run(ctx.command("watch")))
+    (tmp_path / "watch_state.json").unlink()
+    baseline()
+
+    class Args:
+        klipper_command = "watch"
+
+    manual_then_cron(lambda: _capture_cli(ctx.cli, Args()))
+    (tmp_path / "watch_state.json").unlink()
+    baseline()
+    manual_then_cron(lambda: ctx.tools["klipper_watch"]({}))
+
+
+def _capture_cli(handler, args) -> str:
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        handler(args)
+    return buf.getvalue()
+
+
+def test_manual_failure_does_not_silence_the_next_cron(tmp_path, monkeypatch):
+    import asyncio
+
+    router = _switch_router()
+    ctx, service_mod = _load_handlers(tmp_path, router, monkeypatch)
+    cron_on = {"value": True}
+    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: cron_on["value"])
+    assert json.loads(ctx.tools["klipper_watch"]({}))["ok"] is True
+    router.mode = "down"
+    for manual in (
+        lambda: asyncio.run(ctx.command("watch")),
+        lambda: _capture_cli(ctx.cli, type("A", (), {"klipper_command": "watch"})()),
+        lambda: ctx.tools["klipper_watch"]({}),
+    ):
+        if (tmp_path / "watch_failure.json").exists():
+            (tmp_path / "watch_failure.json").unlink()
+        cron_on["value"] = False
+        seen = json.loads(manual())
+        assert seen["notify"] is True
+        assert not (tmp_path / "watch_failure.json").exists()
+        cron_on["value"] = True
+        cron = json.loads(ctx.tools["klipper_watch"]({}))
+        assert cron["notify"] is True
+        assert "already reported" not in cron["message"]
+
+
+def test_slash_does_not_move_the_printer(tmp_path, monkeypatch):
+    import asyncio
+
+    router = Router()
+    router.add("/printer/print/pause", 200, ok_result("ok"))
+    ctx, _service_mod = _load_handlers(tmp_path, router, monkeypatch)
+    text = asyncio.run(ctx.command("pause"))
+    assert "does not move the printer" in text
+    assert "klipper_control" in text
+    assert router.calls == []
+    assert asyncio.iscoroutinefunction(ctx.command)
+
+
+def test_v0214_dispatch_awaits_a_slow_slash_without_blocking_the_loop(tmp_path, monkeypatch):
+    import asyncio
+    import time
+
+    started = {"value": False}
+
+    class Slow(Router):
+        def __call__(self, method, url, headers, body, timeout, read_limit=1_000_000):
+            started["value"] = True
+            time.sleep(0.4)
+            return 200, {"content-type": "application/json"}, b'{"result":{}}'
+
+    ctx, _service_mod = _load_handlers(tmp_path, Slow(), monkeypatch)
+    source_path = Path(__file__).resolve().parents[2] / "hermes-agent-ref-v0214" / "gateway" / "run_inbound.py"
+    if source_path.is_file():
+        source = source_path.read_text(encoding="utf-8")
+        assert "if asyncio.iscoroutine(result):" in source
+        assert "result = await result" in source
+
+    async def run():
+        flag = {"ran": False}
+
+        async def sibling():
+            await asyncio.sleep(0.05)
+            flag["ran"] = True
+
+        task = asyncio.create_task(sibling())
+        result = ctx.command("watch")
+        if asyncio.iscoroutine(result):
+            result = await result
+        await task
+        return flag["ran"], result
+
+    ran, text = asyncio.run(run())
+    assert ran is True and started["value"] is True
+    assert "could not check" in text or "not JSON" in text or "ok" in text

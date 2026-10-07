@@ -1,5 +1,7 @@
 """Klipper print watch for Hermes, built on the Moonraker HTTP API."""
 
+import asyncio
+
 
 def register(ctx) -> None:
     if __package__:
@@ -45,7 +47,11 @@ def register(ctx) -> None:
         return control(_deps(), args or {})
 
     def _watch(args, **_kwargs):
-        return watch(_deps(), args or {})
+        if __package__:
+            from . import service as svc
+        else:
+            import service as svc
+        return watch(_deps(), args or {}, advance=svc._is_cron_turn())
 
     ctx.register_tool(
         name="klipper_status",
@@ -109,7 +115,8 @@ def register(ctx) -> None:
                 "other repeats are silent, and the next working check says so once. Arguments are refused and not recorded as a failure. "
                 "Only stalled uses this test: while printing, file_position is a number, and file_position, progress, and the filename all stayed the same for stall_minutes. A missing file_position is not a stall. "
                 "Does not move the printer. "
-                "Takes no arguments. Vision, if enabled in config, is one model call and still does not cancel."
+                "A chat, slash, or CLI check does not update the cron watch. Only a cron turn writes watch_state.json and the failure record. "
+                "Takes no arguments. Vision, if enabled in config, is one model call on a cron turn and still does not cancel."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -117,31 +124,38 @@ def register(ctx) -> None:
         emoji="👀",
     )
 
-    def _slash(raw_args: str) -> str:
+    def _slash_sync(raw_args: str) -> str:
         parts = (raw_args or "").split()
         cmd = parts[0] if parts else "status"
         if cmd == "status":
             return _status({})
         if cmd == "watch":
-            return _watch({})
+            return watch(_deps(), {}, advance=False)
         if cmd in {"pause", "resume", "cancel"}:
-            return _control({"action": cmd})
+            return (
+                f"/{cmd} was not sent. This slash command does not move the printer. "
+                "Ask the agent to call klipper_control so that tool can request approval."
+            )
         if cmd == "schedule":
             when, deliver = slash_schedule_args(parts)
             return schedule(_deps(), when, deliver)
         if cmd == "unschedule":
             return unschedule(_deps())
         return (
-            "Usage: /klipper-print-watch status | watch | pause | resume | cancel | "
+            "Usage: /klipper-print-watch status | watch | "
             "schedule <deliver> [cron expression] | unschedule. "
             "The cron expression is the rest of the line, so spaces stay in it. "
-            "pause, resume, and cancel ask for approval."
+            "pause, resume, and cancel are not accepted here. "
+            "Ask the agent to call klipper_control so that tool can request approval."
         )
+
+    async def _slash(raw_args: str) -> str:
+        return await asyncio.to_thread(_slash_sync, raw_args)
 
     ctx.register_command(
         "klipper-print-watch",
         handler=_slash,
-        description="Read or move the configured Klipper printer. Moving it asks for approval.",
+        description="Read the configured Klipper printer or schedule a watch. It does not move the printer.",
     )
 
     def _setup(parser) -> None:
@@ -160,7 +174,7 @@ def register(ctx) -> None:
         cmd = getattr(args, "klipper_command", None) or "status"
         deps = _deps()
         if cmd == "watch":
-            print(watch(deps, {}))
+            print(watch(deps, {}, advance=False))
         elif cmd == "schedule":
             print(schedule(deps, args.schedule, args.deliver))
         elif cmd == "unschedule":

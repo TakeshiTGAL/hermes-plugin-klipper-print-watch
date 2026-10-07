@@ -397,7 +397,7 @@ def control(deps: Deps, args: dict | None = None) -> str:
         result = api.request_json("POST", f"/printer/print/{action}", timeout=CONTROL_TIMEOUT_SECONDS)
     except MoonrakerError as exc:
         note = ""
-        if exc.code == "timeout":
+        if exc.code in {"timeout", "network"}:
             try:
                 later = _print_state(api)
                 note = (
@@ -406,7 +406,6 @@ def control(deps: Deps, args: dict | None = None) -> str:
                 )
             except Exception:
                 note = " A later read of print_stats also failed."
-        if exc.code == "timeout":
             note += (
                 f" The {action} command may still have reached the printer and may take effect later, "
                 "for example after a long wait command finishes."
@@ -579,18 +578,37 @@ def _failure_record(deps: Deps) -> tuple[Path | None, dict | None, bool]:
     return path, raw, False
 
 
-def _watch_failed(deps: Deps, code: str, message: str, next_step: str) -> str:
+def _is_cron_turn() -> bool:
+    """True only when Hermes says this turn is cron. A missing helper does not count as cron."""
+    try:
+        from tools.approval_context import _is_cron_approval_context
+    except Exception:
+        return False
+    try:
+        return _is_cron_approval_context() is True
+    except Exception:
+        return False
+
+
+def _watch_failed(deps: Deps, code: str, message: str, next_step: str, *, advance: bool = True) -> str:
     """A watch that could not check the printer.
 
     Notify on the first failure of a run, when the cause changes, and again every
     FAILURE_REMIND_SECONDS while it continues. An unreadable failure record is left in
     place and every failure reports until it is removed.
+    A check with advance False does not read or write the failure record.
     """
-    path, record, unreadable = _failure_record(deps)
-    now = deps.now()
     detail = (message or "no detail").strip()
     if not detail.endswith((".", "!", "?")):
         detail += "."
+    if not advance:
+        text = (
+            f"The printer watch could not check the printer ({code}): {detail} "
+            "This check did not update the cron failure record, so the owner's next cron run can still report it."
+        )
+        return fail(code, text, next_step, notify=True, failure_reported_before=False)
+    path, record, unreadable = _failure_record(deps)
+    now = deps.now()
     text = f"The printer watch could not check the printer ({code}): {detail}"
     if path is None:
         text += " This failure could not be recorded, so the next failed check will report again."
@@ -642,7 +660,7 @@ def _clear_failure(deps: Deps) -> str | None:
     return f"The printer watch can check the printer again (the earlier failure was {record.get('error') or 'unknown'})."
 
 
-def watch(deps: Deps, args: dict | None = None) -> str:
+def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
     args = dict(args or {})
     bad = _unexpected(args, set())
     if bad:
@@ -657,16 +675,25 @@ def watch(deps: Deps, args: dict | None = None) -> str:
             "no_state_dir",
             "Hermes plugin data directory is not available, so this check did not compare or store anything.",
             "Run it inside Hermes so plugin_data_dir works. Nothing was sent to the printer.",
+            advance=advance,
         )
     path = deps.data_dir / "watch_state.json"
     prev, problem = _read_watch(path)
     if problem:
-        return _watch_failed(deps, "bad_state", problem, "Leave the file in place until you have copied anything you still need. This check did not replace it and did not move the printer.")
+        return _watch_failed(
+            deps, "bad_state", problem,
+            "Leave the file in place until you have copied anything you still need. This check did not replace it and did not move the printer.",
+            advance=advance,
+        )
     try:
         body = _status_body(deps, include_snapshot=False, include_files=False)
     except MoonrakerError as exc:
-        return _watch_failed(deps, exc.code, exc.message, exc.next_step or "The previous watch state was left unchanged.")
-    recovered = _clear_failure(deps)
+        return _watch_failed(
+            deps, exc.code, exc.message,
+            exc.next_step or "The previous watch state was left unchanged.",
+            advance=advance,
+        )
+    recovered = _clear_failure(deps) if advance else None
     sample = watch_state.sample_from_status(body["printer_objects"])
     new_state, events, note = watch_state.compare(prev, sample, deps.now(), deps.stall_minutes)
     unreadable_note = None
@@ -677,11 +704,12 @@ def watch(deps: Deps, args: dict | None = None) -> str:
                 f"The failure record {FAILURE_FILE} is unreadable and was left as it is. "
                 f"Delete {failure_path} so later outages are counted again; until then every failed check reports."
             )
-        new_state["failure_record_unreadable_reported"] = True
-    write_error = _write_watch(deps, path, new_state)
+        if advance:
+            new_state["failure_record_unreadable_reported"] = True
+    write_error = _write_watch(deps, path, new_state) if advance else None
     vision = {"enabled": False, "calls": 0, "moved_printer": False}
     snapshot = None
-    if deps.vision_check:
+    if advance and deps.vision_check:
         try:
             api = _client(deps)
             snapshot = _snapshot(deps, api)
@@ -697,8 +725,10 @@ def watch(deps: Deps, args: dict | None = None) -> str:
     message = " ".join(parts) if parts else note
     if write_error:
         message += " The new sample was not saved, so the next check may repeat this."
+    if not advance and (events or unreadable_note):
+        message += " This check did not update the cron watch, so the owner's next cron run can still report it."
     return dumps({
-        "ok": write_error is None,
+        "ok": True if not advance else write_error is None,
         "moved": False,
         "notify": notify,
         "note": note,
@@ -710,7 +740,7 @@ def watch(deps: Deps, args: dict | None = None) -> str:
         "klippy_message": body.get("klippy_message"),
         "recovered": recovered is not None,
         "message": message,
-        "state_saved": write_error is None,
+        "state_saved": False if not advance else write_error is None,
         "state_error": write_error,
         "vision": vision,
         "snapshot": None if snapshot is None else {"ok": snapshot.get("ok"), "path": snapshot.get("path"), "message": snapshot.get("message")},
@@ -923,6 +953,59 @@ def _target_looks_like_schedule(target: str) -> bool:
         return False
 
 
+# Union of Hermes v0.21.4 and current main cron delivery platforms. cli, cron, and
+# api_server are not in either list. homeassistant is only in v0.21.4.
+_DELIVER_PLATFORMS = frozenset({
+    "telegram", "discord", "slack", "whatsapp", "signal",
+    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
+    "qqbot", "yuanbao",
+})
+_DELIVER_SPECIAL = frozenset({"local", "origin", "all"})
+
+
+def _extra_platform_names() -> set[str]:
+    """Platforms a loaded plugin registered. Import failures mean none, not every name."""
+    try:
+        from gateway.platform_registry import platform_registry
+    except Exception:
+        return set()
+    try:
+        return {str(name).strip().lower() for name in platform_registry.registered_names() if str(name).strip()}
+    except Exception:
+        return set()
+
+
+def canonical_deliver(value: str) -> str | None:
+    """Return a deliver string Hermes cron can route, or None when a part would be stored and then dropped."""
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        return None
+    known = _DELIVER_PLATFORMS | _extra_platform_names()
+    kept: list[str] = []
+    for part in parts:
+        low = part.lower()
+        if low in _DELIVER_SPECIAL or low in known:
+            kept.append(low)
+            continue
+        if low == "bot-chat":
+            kept.append("bot-chat")
+            continue
+        if low.startswith("bot-chat:"):
+            name = part.split(":", 1)[1].strip()
+            if not name:
+                return None
+            kept.append("bot-chat:" + name)
+            continue
+        if ":" in part:
+            platform, rest = part.split(":", 1)
+            if platform.strip().lower() in known and rest.strip():
+                kept.append(platform.strip().lower() + ":" + rest.strip())
+                continue
+        return None
+    return ",".join(kept)
+
+
 def deliver_looks_like_schedule(deliver: str) -> bool:
     """True when a deliver target (or any comma-separated part of it) reads like a schedule word."""
     return any(_target_looks_like_schedule(part) for part in deliver.split(","))
@@ -951,6 +1034,15 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "`/klipper-print-watch schedule telegram every 5m`, or "
             "`hermes klipper-print-watch schedule --deliver telegram --schedule \"every 5m\"`.",
         )
+    accepted = canonical_deliver(deliver)
+    if accepted is None:
+        return fail(
+            "bad_deliver",
+            f"The delivery target {deliver.strip()!r} is not a Hermes cron destination, so no cron job was created.",
+            "Use local, origin, all, a platform name such as telegram, platform:chat_id, bot-chat, "
+            "or a comma combination such as origin,all. cli, cron, and api_server are not delivery targets.",
+        )
+    deliver = accepted
     refusal = _schedule_refusal(when)
     if refusal:
         return fail(
@@ -1008,6 +1100,10 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "makes two or more model requests. Every 5 minutes is 288 runs a day. "
             "The job only calls klipper_watch. Removing this plugin does not remove the job; "
             "run unschedule before removing the plugin."
+            + (
+                " bot-chat delivery starts one model turn, and the agent can act on that text."
+                if "bot-chat" in deliver.lower() else ""
+            )
         ),
         "agent_turns_per_run": 1,
         "job_id": created.get("id"),
