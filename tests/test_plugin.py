@@ -790,7 +790,7 @@ def test_cron_prompt_handles_failures_and_schedule_discloses_agent_turns(tmp_pat
     assert "[SILENT]" in CRON_PROMPT
     assert "did not run" in CRON_PROMPT
     out = json.loads(schedule(deps(tmp_path, Router(), cron_module=Jobs()), "*/5 * * * *", "local"))
-    assert "one Hermes agent turn" in out["message"] and "288" in out["message"]
+    assert "at least one model turn" in out["message"] and "288" in out["message"]
     assert out["agent_turns_per_run"] == 1
 
 
@@ -807,3 +807,167 @@ def test_declared_size_over_the_cap_says_over_the_cap(tmp_path):
     short = json.loads(status(deps(tmp_path, router), {"include_snapshot": True}))
     assert "Content-Length" in short["snapshot"]["message"] and "cap" not in short["snapshot"]["message"]
     assert list(tmp_path.rglob("*.jpg")) == []
+
+
+class _Switch(Router):
+    """Router that can raise a network error or answer 401 instead of the routes."""
+    mode = "ok"
+
+    def __call__(self, method, url, headers, body, timeout, read_limit=1_000_000):
+        if self.mode == "down":
+            raise OSError("connection refused")
+        if self.mode == "unauthorized":
+            return 401, {"content-type": "application/json"}, env_error("Unauthorized", "Invalid API Key", 401)
+        return Router.__call__(self, method, url, headers, body, timeout, read_limit)
+
+
+def _switch_router() -> _Switch:
+    router = _Switch()
+    router.add("/printer/objects/query", 200, ok_result(PRINTING))
+    router.add("/server/files/metadata", 200, ok_result({}))
+    return router
+
+
+def test_wrong_arguments_are_not_recorded_as_a_printer_failure(tmp_path):
+    router = _switch_router()
+    dep = deps(tmp_path, router)
+    wrong = json.loads(watch(dep, {"include_snapshot": True}))
+    assert wrong["ok"] is False and wrong["error"] == "bad_args" and wrong["notify"] is True
+    assert "not checked" in wrong["message"]
+    assert not (tmp_path / "watch_failure.json").exists()
+    assert router.calls == []
+    router.mode = "down"
+    real = json.loads(watch(dep, {}))
+    assert real["notify"] is True and real["error"] == "network"
+    assert json.loads(watch(dep, {"x": 1}))["notify"] is True
+    assert json.loads(watch(dep, {}))["notify"] is False
+    record = json.loads((tmp_path / "watch_failure.json").read_text(encoding="utf-8"))
+    assert record["error"] == "network"
+
+
+def test_unreadable_failure_record_is_reported_and_left_in_place(tmp_path):
+    path = tmp_path / "watch_failure.json"
+    path.write_text("{not json", encoding="utf-8")
+    router = _switch_router()
+    router.mode = "down"
+    dep = deps(tmp_path, router)
+    for _ in range(2):
+        out = json.loads(watch(dep, {}))
+        assert out["notify"] is True and out["failure_record_unreadable"] is True
+        assert "unreadable" in out["message"] and "delete" in out["message"]
+        assert path.read_text(encoding="utf-8") == "{not json"
+    router.mode = "ok"
+    ok = json.loads(watch(dep, {}))
+    assert ok["ok"] is True and ok["recovered"] is False
+    assert ok["notify"] is True and "unreadable" in ok["message"]
+    assert json.loads(watch(dep, {}))["notify"] is False
+    assert path.read_text(encoding="utf-8") == "{not json"
+
+
+def test_a_new_failure_cause_is_reported_again(tmp_path):
+    router = _switch_router()
+    router.mode = "down"
+    dep = deps(tmp_path, router)
+    assert json.loads(watch(dep, {}))["notify"] is True
+    assert json.loads(watch(dep, {}))["notify"] is False
+    router.mode = "unauthorized"
+    changed = json.loads(watch(dep, {}))
+    assert changed["notify"] is True and changed["error"] == "unauthorized"
+    assert "cause changed (it was network)" in changed["message"]
+    assert json.loads(watch(dep, {}))["notify"] is False
+
+
+def test_a_continuing_failure_is_reported_again_after_24_hours(tmp_path):
+    router = _switch_router()
+    router.mode = "down"
+    clock = {"t": 1_000_000.0}
+    dep = deps(tmp_path, router, now=lambda: clock["t"])
+    assert json.loads(watch(dep, {}))["notify"] is True
+    clock["t"] += 23 * 3600
+    assert json.loads(watch(dep, {}))["notify"] is False
+    clock["t"] += 3600
+    again = json.loads(watch(dep, {}))
+    assert again["notify"] is True and "once a day" in again["message"]
+    clock["t"] += 60
+    assert json.loads(watch(dep, {}))["notify"] is False
+    router.mode = "ok"
+    back = json.loads(watch(dep, {}))
+    assert back["recovered"] is True and back["notify"] is True
+
+
+class _KeptJobs:
+    """Fake cron.jobs with one existing klipper-print-watch job delivering to telegram."""
+
+    def __init__(self):
+        self.jobs = [{"name": "klipper-print-watch", "id": "old1", "deliver": "telegram"}]
+        self.created = []
+        self.removed = []
+
+    def list_jobs(self, include_disabled=True):
+        return list(self.jobs)
+
+    def create_job(self, **kwargs):
+        self.created.append(kwargs)
+        job = {"id": f"new{len(self.created)}", "name": kwargs["name"], "deliver": kwargs["deliver"],
+               "schedule_display": kwargs["schedule"]}
+        self.jobs.append(job)
+        return job
+
+    def remove_job(self, job_id):
+        self.removed.append(job_id)
+        self.jobs = [job for job in self.jobs if job["id"] != job_id]
+
+
+@pytest.mark.parametrize("line", ["schedule every 5m", "schedule 5m", "schedule in 30m"])
+def test_slash_schedule_refuses_a_schedule_word_as_the_deliver_target(tmp_path, line):
+    jobs = _KeptJobs()
+    when, deliver = slash_schedule_args(line.split())
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), when, deliver))
+    assert out["ok"] is False and out["error"] == "deliver_looks_like_schedule"
+    assert "/klipper-print-watch schedule telegram every 5m" in out["next_step"]
+    assert "--deliver telegram" in out["next_step"]
+    assert jobs.created == [] and jobs.removed == []
+    assert [job["id"] for job in jobs.jobs] == ["old1"]
+
+
+@pytest.mark.parametrize("target", ["mon", "*/5", "@hourly", "2026-10-08T09:00", "daily", "10:30"])
+def test_other_schedule_shapes_are_refused_as_deliver_targets(tmp_path, target):
+    jobs = _KeptJobs()
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", target))
+    assert out["error"] == "deliver_looks_like_schedule"
+    assert jobs.created == []
+
+
+@pytest.mark.parametrize("target", ["telegram", "discord:123", "local", "origin"])
+def test_real_deliver_targets_still_schedule(tmp_path, target):
+    jobs = _KeptJobs()
+    when, deliver = slash_schedule_args(["schedule", target, "every", "5m"])
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), when, deliver))
+    assert out["ok"] is True, out
+    assert jobs.created[0]["deliver"] == target and jobs.created[0]["schedule"] == "every 5m"
+    assert jobs.removed == ["old1"]
+    assert out["replaced_job_id"] == "old1" and out["previous_deliver"] == "telegram"
+    if target == "telegram":
+        assert "which also delivered to telegram" in out["message"]
+    else:
+        assert "which delivered to telegram; results now go to" in out["message"]
+
+
+def test_control_timeout_says_the_command_may_still_arrive(tmp_path):
+    class Slow(Router):
+        def __call__(self, method, url, headers, body, timeout, read_limit=1_000_000):
+            if "/printer/print/" in url:
+                raise TimeoutError("timed out")
+            return Router.__call__(self, method, url, headers, body, timeout, read_limit)
+
+    router = Slow()
+    router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}))
+    out = json.loads(control(deps(tmp_path, router), {"action": "cancel"}))
+    assert out["moved"] is False
+    assert "may still have reached the printer and may take effect later" in out["message"]
+    assert "do not send it again yet" in out["next_step"]
+
+
+def test_cancel_approval_text_says_it_cannot_be_resumed():
+    assert "cannot be resumed" in safety.approval_text("cancel", "http://printer.local:7125")
+    assert "cannot be resumed" not in safety.approval_text("pause", "http://printer.local:7125")

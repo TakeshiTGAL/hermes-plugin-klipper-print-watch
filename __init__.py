@@ -105,8 +105,8 @@ def register(ctx) -> None:
                 "klippy_shutdown means Klipper itself stopped (webhooks.state shutdown or error), printing or not; "
                 "it is not reported as paused. "
                 "paused is reported only when the previous state was printing and Klipper is still running. "
-                "If the printer cannot be checked, the first failure in a row has notify true and later ones are silent; "
-                "the next working check says so once. "
+                "If the printer cannot be checked, notify is true on the first failure, when the cause changes, and once a day; "
+                "other repeats are silent, and the next working check says so once. Arguments are refused and not recorded as a failure. "
                 "Only stalled uses this test: while printing, file_position is a number, and file_position, progress, and the filename all stayed the same for stall_minutes. A missing file_position is not a stall. "
                 "Does not move the printer. "
                 "Takes no arguments. Vision, if enabled in config, is one model call and still does not cancel."
@@ -150,7 +150,7 @@ def register(ctx) -> None:
         subs.add_parser("watch", help="Compare with the previous sample. Does not move the printer.")
         p = subs.add_parser(
             "schedule",
-            help="Create a Hermes cron job that only calls klipper_watch. Each run is one agent turn on your model.",
+            help="Create a Hermes cron job that only calls klipper_watch. Each run is at least one model turn.",
         )
         p.add_argument("--deliver", default="", help="telegram, discord, slack, local, or platform:chat_id. Required.")
         p.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="Cron expression. No faster than every 2 minutes.")

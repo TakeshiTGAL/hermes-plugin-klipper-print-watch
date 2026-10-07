@@ -2,7 +2,7 @@
 
 Watch a Klipper printer from Hermes, built on the Moonraker HTTP API.
 
-It reads print state, progress, extruder and bed temperatures, and a slicer time estimate. It can save one webcam still. It can pause, resume, or cancel only after Hermes asks a person, and only when `print_stats.state` is not already the result of that action. It reports a move only when a later read shows the state changed. Every pause, resume, or cancel asks a person again; an earlier `session` or `always` answer is not reused. A scheduled watch reports `klippy_shutdown` (Klipper itself stopped, printing or not), `complete`, `error`, `paused` (only when the previous state was `printing` and Klipper is still running), `cancelled`, and `stalled`. If the watch cannot reach the printer, it says so once. The watch does not move the printer. Each scheduled check is one Hermes agent turn on your model.
+It reads print state, progress, extruder and bed temperatures, and a slicer time estimate. It can save one webcam still. It can pause, resume, or cancel only after Hermes asks a person, and only when `print_stats.state` is not already the result of that action. It reports a move only when a later read shows the state changed. Every pause, resume, or cancel asks a person again; an earlier `session` or `always` answer is not reused. A scheduled watch reports `klippy_shutdown` (Klipper itself stopped, printing or not), `complete`, `error`, `paused` (only when the previous state was `printing` and Klipper is still running), `cancelled`, and `stalled`. If the watch cannot reach the printer, it says so once per cause, with a daily reminder. The watch does not move the printer. Each scheduled check is one Hermes agent turn on your model.
 
 Hermes also has a Home Assistant plugin. This one talks to Moonraker directly, so it does not need Home Assistant.
 
@@ -51,7 +51,7 @@ All three tools use the toolset `klipper_print_watch`.
 | `klipper_control` | `pause`, `resume`, or `cancel` only, after approval. Nothing is sent if `print_stats.state` is already the result. A move is reported only when a later read shows it changed. |
 | `klipper_watch` | Compare with the previous sample. No arguments. Does not move the printer. |
 
-`/klipper-print-watch` accepts `status`, `watch`, `pause`, `resume`, `cancel`, `schedule <deliver> [cron expression]`, and `unschedule`. The cron expression is the rest of the line, so `schedule telegram */5 * * * *` stays five fields. Pause, resume, and cancel use the same approval gate as the tool.
+`/klipper-print-watch` accepts `status`, `watch`, `pause`, `resume`, `cancel`, `schedule <deliver> [cron expression]`, and `unschedule`. The deliver target comes first and the schedule is the rest of the line, so `schedule telegram */5 * * * *` stays five fields and `schedule telegram every 5m` works. A first word that looks like a schedule (`every`, `in`, `at`, a weekday, a word starting with a digit, `*`, or `@`, a duration such as `5m`, a word with `/`, or an ISO date) is refused as the deliver target: no job is created and an existing job is kept. When a new schedule replaces the existing job, the reply names the previous job and its deliver target. Pause, resume, and cancel use the same approval gate as the tool.
 
 `hermes klipper-print-watch` accepts `status`, `watch`, `schedule`, and `unschedule`. It does not pause, resume, or cancel.
 
@@ -59,7 +59,7 @@ There is no G-code tool, no temperature tool, and no emergency-stop tool.
 
 ## Approval
 
-`klipper_control` calls Hermes `request_tool_approval` with a new `rule_key` on every call (`klipper_control:<action>:<random id>`). The prompt names the printer origin, the call (`POST /printer/print/pause`, `resume`, or `cancel`), and the action. It refuses without sending HTTP when:
+`klipper_control` calls Hermes `request_tool_approval` with a new `rule_key` on every call (`klipper_control:<action>:<random id>`). The prompt names the printer origin, the call (`POST /printer/print/pause`, `resume`, or `cancel`), and the action. For cancel it also says that the print ends and cannot be resumed. It refuses without sending HTTP when:
 
 - the turn is cron, a single-query session, or an unattended platform (webhook, api_server)
 - the plugin runs in a separate plugin-host process (`plugins.isolation: host`, seen as `HERMES_PLUGIN_HOST_PROCESS`). There, Hermes's cron, yolo, and approval checks may not see the conversation, so moving the printer is refused. Use `plugins.isolation: in_process` to move it.
@@ -70,7 +70,7 @@ Choose **once**. Because the `rule_key` is new each time, `session` and `always`
 
 The prompt waits up to Hermes `approvals.timeout` (default 300 seconds). No answer is a refusal, and nothing is sent.
 
-There is no separate user allowlist. Anyone who can make this Hermes session call tools can read status. Moving the printer still needs the approval above. If a messaging gateway lets every guest talk, those guests can ask the agent to call `klipper_control`. The move still waits for the approval prompt, which may be in that same chat.
+This plugin has no allowlist of its own. Whoever the Hermes gateway admits (a platform or `GATEWAY_ALLOWED_USERS` allowlist entry, a paired user, or an allow-all setting such as `GATEWAY_ALLOW_ALL_USERS`) can ask the agent to read status or to call `klipper_control`, and can answer `/approve` for a prompt in their own chat session. In a group chat admitted as a whole by a chat-level allowlist (`<PLATFORM>_GROUP_ALLOWED_CHATS`, for example `TELEGRAM_GROUP_ALLOWED_CHATS`, or the Telegram adapter's `group_allowed_chats`), every member of that chat can ask, and any member can answer an approval prompt shown there: an approval button is accepted from anyone the gateway admits in that chat, including on someone else's request. A typed `/approve` answers the prompts of the sender's own session; group sessions are per member by default (`group_sessions_per_user`), and a thread is one shared session. With no allowlist and no allow-all setting, Hermes refuses unknown users by default. Moving the printer still needs the approval above.
 
 ## Watch and cron
 
@@ -90,7 +90,7 @@ A pause is not a stall. A missing `file_position` does not become a stall. Remai
 
 A corrupt or unknown-version state file is left in place and the check stops. Rescheduling or unscheduling does not delete it.
 
-When a check cannot reach the printer or cannot run (timeout, network error, 401, a non-JSON body, a corrupt state file), the result has `notify: true` the first time and `notify: false` while the failure continues, so the job does not repeat the same message every tick. This is recorded in `watch_failure.json` next to the state file. The first check that works again reports once that the printer can be checked again. If the failure cannot be recorded (no plugin data directory, or the write guard denies the file), every failed check reports.
+When a check cannot reach the printer or cannot run (timeout, network error, 401, a non-JSON body, a corrupt state file), the result has `notify: true` the first time, again when the cause changes (for example from `network` to `unauthorized`), and again every 24 hours while it continues. Otherwise it has `notify: false`, so the job does not repeat the same message every tick. This is recorded in `watch_failure.json` next to the state file. The first check that works again reports once that the printer can be checked again. If the failure cannot be recorded (no plugin data directory, or the write guard denies the file), every failed check reports. If `watch_failure.json` itself is unreadable, it is left as it is, every failed check reports and asks you to delete it, and a working check reports it once. Calling `klipper_watch` with arguments is a wrong call, not a printer failure: it reports, checks nothing, and is not recorded.
 
 ```bash
 hermes klipper-print-watch schedule --deliver telegram
@@ -100,9 +100,9 @@ hermes klipper-print-watch unschedule
 
 `--deliver` is required. `local` stays in `hermes cron list` and is not sent to a chat. Any other target is stored as Hermes `deliver`. This plugin does not check that the platform or the chat exists, and the success text does not say the message was delivered. Schedules faster than every 2 minutes are refused (`1m`, `every 1m`, `* * * * *`, `0-59 * * * *`, `* * * * * *`). A schedule this plugin cannot measure, including `every 30s` and phrases such as `every monday 9am`, is also refused instead of created. One-shot forms such as `in 30m` and an ISO timestamp are allowed because they fire once. The default is `*/5 * * * *`. The job's prompt tells the agent to call `klipper_watch` only. The toolset still contains `klipper_control`; the handler refuses it during cron.
 
-Cost: a Hermes cron job runs one agent turn every time it fires, including the many times there is nothing to report. Each turn uses your configured model, usually at least two calls (one to call `klipper_watch`, one to reply). The default `*/5 * * * *` is 288 turns a day. Use a slower schedule if that cost matters. The turn's reply is `[SILENT]` when there is nothing to report, so nothing is delivered then.
+Cost: a Hermes cron job runs at least one model turn every time it fires, including the many times there is nothing to report; a turn that calls a tool makes two or more model requests. The default `*/5 * * * *` is 288 runs a day. Use a slower schedule if that cost matters. The turn's reply is `[SILENT]` when there is nothing to report, so nothing is delivered then.
 
-The gateway must be running for Hermes cron (`hermes gateway`). Removing the plugin does not remove the job. `unschedule`, or `hermes cron list` and remove `klipper-print-watch`, does. Snapshots, `watch_state.json`, and `watch_failure.json` stay until you delete them under the plugin data directory.
+The gateway must be running for Hermes cron (`hermes gateway`). Removing the plugin does not remove the job: it keeps firing, keeps costing a model turn each time, and with the tool gone it can only reply that `klipper_watch` did not run. Run `hermes klipper-print-watch unschedule` (or `/klipper-print-watch unschedule`) before `hermes plugins remove`, or afterwards remove `klipper-print-watch` from `hermes cron list`. Snapshots, `watch_state.json`, and `watch_failure.json` stay until you delete them under the plugin data directory.
 
 ## Webcam stills and the optional model check
 
@@ -114,10 +114,10 @@ The gateway must be running for Hermes cron (`hermes gateway`). Removing the plu
 
 - One configured origin. Tool arguments cannot replace it. Redirects: at most 2, and only to that same origin.
 - JSON reads: 10 seconds, 1000000 bytes, no retries.
-- Pause, resume, and cancel: one state read, then 60 seconds, no retries, then another state read. A timeout is not a successful move. The reply says to read status. A later state, when one could be read, is information only.
+- Pause, resume, and cancel: one state read, then 60 seconds, no retries, then another state read. A timeout is not a successful move: the command may still have reached the printer and take effect later, so the reply says to read status before sending it again. A later state, when one could be read, is information only.
 - While the printer is executing a long wait command (for example a temperature wait, or a dwell), cancel may not take effect immediately. If Moonraker does not answer within 60 seconds, or a later read does not show the expected state, this plugin does not report success.
 - Snapshot download: 15 seconds.
-- No Moonraker daily cap. The schedule is the cap on unattended checks, and each check is one agent turn on your model (288 turns a day at the default schedule).
+- No Moonraker daily cap. The schedule is the cap on unattended checks, and each check is at least one model turn (288 runs a day at the default schedule).
 - Before a pause, resume, or cancel is sent, the approval prompt can wait up to `approvals.timeout` (default 300 seconds).
 - No child process.
 
@@ -125,12 +125,12 @@ The gateway must be running for Hermes cron (`hermes gateway`). Removing the plu
 
 This plugin reads Hermes modules that are not a stable public SDK: `tools.approval`, `tools.approval_context`, `agent.file_safety`, `plugins.plugin_storage`, `cron.jobs`, and `agent.plugin_llm`. If one of those imports or calls fails, or a helper is missing or renamed, a move is refused, a still is not saved, or scheduling reports that cron is unavailable. A missing check is not treated as "not in that mode."
 
-The agent can call the tools itself. Every motion call asks again: the per-call `rule_key` means a `session` or `always` answer is not reused, and each `always` answer adds one unused line to `command_allowlist` in `config.yaml` (delete lines starting `plugin_rule:klipper_control:`). With `plugins.isolation: host`, motion is refused and `hermes klipper-print-watch` is not registered (Hermes skips CLI commands in the plugin host). The tools and the slash command are still registered there; reading and watching inside the plugin host were not tested. There is no user allowlist. Anyone who can call tools in the session can read status. A gateway with an empty guest allowlist can ask; the approval prompt may be in that same chat. Motion still needs the approval gate.
+The agent can call the tools itself. Every motion call asks again: the per-call `rule_key` means a `session` or `always` answer is not reused, and each `always` answer adds one unused line to `command_allowlist` in `config.yaml` (delete lines starting `plugin_rule:klipper_control:`). With `plugins.isolation: host`, motion is refused and `hermes klipper-print-watch` is not registered (Hermes skips CLI commands in the plugin host). The tools and the slash command are still registered there; reading and watching inside the plugin host were not tested. This plugin has no allowlist of its own: whoever the Hermes gateway admits (allowlist, pairing, or allow-all) can ask for status or a move and can answer `/approve` in their chat session. With no allowlist and no allow-all, Hermes refuses unknown users. Motion still needs the approval gate.
 
 What is stored: filename, print state, Klipper state, progress, file position, timestamps, the last watch failure code, and up to 20 stills. Not the API key and not the chat user's name.
 
 There is no Moonraker daily cap. There is no child process, and this plugin is not a sandbox for untrusted code. A control call first waits for the approval prompt (up to `approvals.timeout`, default 300 seconds), then reads `print_stats`, waits up to 60 seconds for the action, then reads `print_stats` again. A timeout is not a successful move. Vision, when enabled, adds one model call of up to 30 seconds. Seeing `print_stats.state` change does not prove the toolhead followed the command.
 
-Cron runs with nobody at the keyboard; it only watches. Each run is one Hermes agent turn on your model (288 a day at the default `*/5 * * * *`). An unreachable printer is reported on the first failed run only, then once when it is reachable again. Removing the plugin does not remove the cron job. `hermes klipper-print-watch unschedule` does. `tests/` is in this repository and `register()` does not load it.
+Cron runs with nobody at the keyboard; it only watches. Each run is at least one model turn; a turn that calls a tool makes two or more model requests (288 runs a day at the default `*/5 * * * *`). An unreachable printer is reported on the first failed run, when the cause changes, and once a day while it continues, then once when it is reachable again. Removing the plugin does not remove the cron job, which keeps firing and costing a turn; run `hermes klipper-print-watch unschedule` first. `tests/` is in this repository and `register()` does not load it.
 
 Moonraker's API is documented at <https://moonraker.readthedocs.io/en/latest/external_api/printer/> and <https://moonraker.readthedocs.io/en/latest/external_api/authorization/>. Printer object fields follow <https://www.klipper3d.org/Status_Reference.html>. The virtual printer image is <https://github.com/mainsail-crew/virtual-klipper-printer>. The demand for a Hermes printer watch is Teknium's device catalog at <https://teknium.io/hermes-devices>.

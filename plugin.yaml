@@ -15,8 +15,9 @@ description: >-
   A cron watch can report klippy_shutdown (Klipper itself stopped, printing
   or not), complete, error, paused (only when the previous state was
   printing and Klipper is running), cancelled, and stalled. An unreachable
-  printer is reported once. Each cron run is one Hermes agent turn on your
-  model (288 a day every 5 minutes).
+  printer is reported once per cause, then daily. Each cron run is at least
+  one model turn; a turn that calls a tool makes two or more model requests
+  (288 runs a day every 5 minutes).
   The watch does not move the printer. Camera failure checks are off unless you
   enable them, and even then they do not cancel the print.
 author: TakeshiTGAL

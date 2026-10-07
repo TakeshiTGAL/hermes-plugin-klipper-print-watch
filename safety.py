@@ -107,7 +107,8 @@ def approval_text(action: str, origin: str) -> str:
         f"Move the Klipper printer at {origin or '(MOONRAKER_URL not set)'}: "
         f"send {ENDPOINTS[action]} (action={action}) to Moonraker. "
         "This pauses, resumes, or cancels a physical print. "
-        "This approval covers this one call only; choose once."
+        + ("Cancel ends the print; it cannot be resumed afterwards. " if action == "cancel" else "")
+        + "This approval covers this one call only; choose once."
     )
 
 

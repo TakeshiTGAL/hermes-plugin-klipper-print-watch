@@ -166,7 +166,10 @@ def _urllib_transport(origin: Origin) -> Transport:
             raise MoonrakerError(
                 "timeout",
                 f"Moonraker did not answer within {timeout:g} seconds.",
-                next_step="Do not assume the printer moved. Call klipper_status and read print_stats.state.",
+                next_step=(
+                    "Do not assume the printer moved. A command may still have reached the printer and take effect later. "
+                    "Call klipper_status and read print_stats.state before sending it again."
+                ),
             ) from None
         except urllib.error.HTTPError as exc:
             raw = exc.read(read_limit + 1)
@@ -216,7 +219,10 @@ class Moonraker:
             raise MoonrakerError(
                 "timeout",
                 "Moonraker did not answer before the timeout.",
-                next_step="Do not assume the printer moved. Call klipper_status and read print_stats.state.",
+                next_step=(
+                    "Do not assume the printer moved. A command may still have reached the printer and take effect later. "
+                    "Call klipper_status and read print_stats.state before sending it again."
+                ),
             ) from None
         except Exception as exc:
             raise MoonrakerError(

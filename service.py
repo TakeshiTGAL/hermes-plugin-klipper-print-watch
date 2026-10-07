@@ -51,6 +51,7 @@ CRON_PROMPT = (
     "klipper_watch did not run, so the printer was not checked."
 )
 FAILURE_FILE = "watch_failure.json"
+FAILURE_REMIND_SECONDS = 24 * 3600
 
 OBJECTS = {
     "print_stats": None,
@@ -405,10 +406,16 @@ def control(deps: Deps, args: dict | None = None) -> str:
                 )
             except Exception:
                 note = " A later read of print_stats also failed."
+        if exc.code == "timeout":
+            note += (
+                f" The {action} command may still have reached the printer and may take effect later, "
+                "for example after a long wait command finishes."
+            )
         return fail(
             exc.code,
             exc.message + note,
-            "Do not assume the printer moved. Call klipper_status and read print_stats.state.",
+            "Do not assume the printer moved, and do not send it again yet. "
+            "Call klipper_status and read print_stats.state first; send it again only if the state has not changed.",
         )
     if result != "ok":
         return fail(
@@ -556,45 +563,75 @@ def _vision(deps: Deps, snapshot: dict) -> dict[str, Any]:
     return base
 
 
-def _failure_record(deps: Deps) -> tuple[Path | None, dict | None]:
+def _failure_record(deps: Deps) -> tuple[Path | None, dict | None, bool]:
+    """(path, record, unreadable). unreadable is True when the file exists but cannot be used."""
     if deps.data_dir is None:
-        return None, None
+        return None, None, False
     path = deps.data_dir / FAILURE_FILE
+    if not path.exists():
+        return path, None, False
     try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        raw = None
-    return path, raw if isinstance(raw, dict) and raw.get("version") == 1 else None
+        return path, None, True
+    if not isinstance(raw, dict) or raw.get("version") != 1 or not isinstance(raw.get("error"), str):
+        return path, None, True
+    return path, raw, False
 
 
 def _watch_failed(deps: Deps, code: str, message: str, next_step: str) -> str:
-    """A watch that could not check the printer. Notify on the first failure of a run of failures."""
-    path, record = _failure_record(deps)
-    first = record is None
-    saved = False
-    if path is not None and first:
-        try:
-            saved = _write_json(deps, path, {"version": 1, "error": code, "since": deps.now()}) is None
-        except OSError:
-            saved = False
-    notify = first or path is None
+    """A watch that could not check the printer.
+
+    Notify on the first failure of a run, when the cause changes, and again every
+    FAILURE_REMIND_SECONDS while it continues. An unreadable failure record is left in
+    place and every failure reports until it is removed.
+    """
+    path, record, unreadable = _failure_record(deps)
+    now = deps.now()
     detail = (message or "no detail").strip()
     if not detail.endswith((".", "!", "?")):
         detail += "."
     text = f"The printer watch could not check the printer ({code}): {detail}"
-    if not first:
-        text += " This failure continues; it was already reported once."
-    elif not saved:
+    if path is None:
+        text += " This failure could not be recorded, so the next failed check will report again."
+        return fail(code, text, next_step, notify=True, failure_reported_before=False)
+    if unreadable:
+        text += (
+            f" The failure record {FAILURE_FILE} is unreadable, so it was left as it is and this check reports. "
+            f"Every failed check will report until you delete {path}."
+        )
+        return fail(code, text, next_step, notify=True, failure_reported_before=False, failure_record_unreadable=True)
+    if record is None:
+        reason = "first"
+    elif record.get("error") != code:
+        reason = "changed"
+    else:
+        last = record.get("notified_at", record.get("since"))
+        last = float(last) if isinstance(last, (int, float)) and not isinstance(last, bool) else 0.0
+        reason = "remind" if now - last >= FAILURE_REMIND_SECONDS else ""
+    if not reason:
+        text += " This failure continues; it was already reported."
+        return fail(code, text, next_step, notify=False, failure_reported_before=True)
+    since = now if record is None or reason == "changed" else record.get("since", now)
+    try:
+        saved = _write_json(deps, path, {"version": 1, "error": code, "since": since, "notified_at": now}) is None
+    except OSError:
+        saved = False
+    if reason == "changed":
+        text += f" The cause changed (it was {record.get('error')})."
+    elif reason == "remind":
+        text += " This failure is still going on; it is reported again once a day."
+    if not saved:
         text += " This failure could not be recorded, so the next failed check will report again."
     else:
-        text += " Later failures in a row stay silent until a check works again."
-    return fail(code, text, next_step, notify=notify, failure_reported_before=not first)
+        text += " Later failures with the same cause stay silent (with a daily reminder) until a check works again."
+    return fail(code, text, next_step, notify=True, failure_reported_before=record is not None)
 
 
 def _clear_failure(deps: Deps) -> str | None:
-    """Remove the failure record after a working check. Return a recovery note when one existed."""
-    path, record = _failure_record(deps)
-    if path is None or not path.exists():
+    """Remove a readable failure record after a working check. Return a recovery note when one existed."""
+    path, record, _unreadable = _failure_record(deps)
+    if path is None or record is None:
         return None
     if _guard(deps, str(path)) is not None:
         return None
@@ -602,16 +639,18 @@ def _clear_failure(deps: Deps) -> str | None:
         path.unlink()
     except OSError:
         return None
-    code = (record or {}).get("error") or "unknown"
-    return f"The printer watch can check the printer again (the earlier failure was {code})."
+    return f"The printer watch can check the printer again (the earlier failure was {record.get('error') or 'unknown'})."
 
 
 def watch(deps: Deps, args: dict | None = None) -> str:
     args = dict(args or {})
     bad = _unexpected(args, set())
     if bad:
+        # A wrong call, not a printer problem: never part of the failure record.
         body = json.loads(bad)
-        return _watch_failed(deps, "bad_args", body["message"], body["next_step"])
+        body["notify"] = True
+        body["message"] = "klipper_watch was called with arguments, so the printer was not checked. " + body["message"]
+        return dumps(body)
     if deps.data_dir is None:
         return _watch_failed(
             deps,
@@ -630,6 +669,15 @@ def watch(deps: Deps, args: dict | None = None) -> str:
     recovered = _clear_failure(deps)
     sample = watch_state.sample_from_status(body["printer_objects"])
     new_state, events, note = watch_state.compare(prev, sample, deps.now(), deps.stall_minutes)
+    unreadable_note = None
+    failure_path, _record, unreadable = _failure_record(deps)
+    if unreadable:
+        if not (prev or {}).get("failure_record_unreadable_reported"):
+            unreadable_note = (
+                f"The failure record {FAILURE_FILE} is unreadable and was left as it is. "
+                f"Delete {failure_path} so later outages are counted again; until then every failed check reports."
+            )
+        new_state["failure_record_unreadable_reported"] = True
     write_error = _write_watch(deps, path, new_state)
     vision = {"enabled": False, "calls": 0, "moved_printer": False}
     snapshot = None
@@ -640,8 +688,10 @@ def watch(deps: Deps, args: dict | None = None) -> str:
         except MoonrakerError as exc:
             snapshot = {"ok": False, "path": None, "message": exc.message}
         vision = _vision(deps, snapshot)
-    notify = bool(events) or vision.get("looks_failed") is True or recovered is not None
+    notify = bool(events) or vision.get("looks_failed") is True or recovered is not None or unreadable_note is not None
     parts = ([recovered] if recovered else []) + [event["text"] for event in events]
+    if unreadable_note:
+        parts.append(unreadable_note)
     if vision.get("looks_failed") is True:
         parts.append(vision["message"])
     message = " ".join(parts) if parts else note
@@ -845,6 +895,39 @@ def _cron(deps: Deps):
         ) from None
 
 
+_SCHEDULE_WORDS = {
+    "every", "in", "at", "on", "daily", "hourly", "weekly", "monthly", "yearly", "annually",
+    "once", "now", "today", "tonight", "tomorrow", "midnight", "noon", "minute", "minutes", "hour", "hours",
+    "day", "days", "week", "weeks",
+}
+_WEEKDAYS = {
+    "mon", "tue", "tues", "wed", "thu", "thur", "thurs", "fri", "sat", "sun",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+}
+
+
+def _target_looks_like_schedule(target: str) -> bool:
+    word = target.strip().lower()
+    if not word:
+        return False
+    if word in _SCHEDULE_WORDS or word in _WEEKDAYS or word.rstrip("s") in _WEEKDAYS:
+        return True
+    if word[0].isdigit() or word[0] in "*@":
+        return True
+    if "/" in word or _duration_minutes(word) is not None:
+        return True
+    try:
+        datetime.fromisoformat(word.replace("z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def deliver_looks_like_schedule(deliver: str) -> bool:
+    """True when a deliver target (or any comma-separated part of it) reads like a schedule word."""
+    return any(_target_looks_like_schedule(part) for part in deliver.split(","))
+
+
 def slash_schedule_args(parts: list[str], default: str = DEFAULT_SCHEDULE) -> tuple[str, str]:
     """Cron expression is every token after the deliver target, spaces included."""
     deliver = parts[1] if len(parts) > 1 else ""
@@ -858,6 +941,15 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "no_deliver",
             "No delivery target was given, so no cron job was created.",
             "Pass a Hermes deliver target such as telegram, discord, slack, or local. local stays on this machine and is not sent to a chat.",
+        )
+    if deliver_looks_like_schedule(deliver):
+        return fail(
+            "deliver_looks_like_schedule",
+            f"The delivery target {deliver.strip()!r} looks like part of a schedule, so no cron job was created "
+            "and any existing klipper-print-watch job was left as it is.",
+            "Put the delivery target first, then the schedule: "
+            "`/klipper-print-watch schedule telegram every 5m`, or "
+            "`hermes klipper-print-watch schedule --deliver telegram --schedule \"every 5m\"`.",
         )
     refusal = _schedule_refusal(when)
     if refusal:
@@ -892,6 +984,14 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
     except Exception as exc:
         return fail("no_cron", f"Could not schedule ({type(exc).__name__}: {exc}).", "No printer call was made. Fix the schedule and try again.")
     target = deliver.strip()
+    replaced = ""
+    if old and old.get("id") and old.get("id") != created.get("id"):
+        previous = str(old.get("deliver") or "(none)")
+        replaced = f" It replaced job {old.get('id')}"
+        replaced += (
+            f", which delivered to {previous}; results now go to {target} instead."
+            if previous != target else f", which also delivered to {target}."
+        )
     if target == "local":
         where = "saved on this machine only (`hermes cron list`). It is not sent to a chat."
     else:
@@ -903,14 +1003,17 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         "ok": True,
         "moved": False,
         "message": (
-            f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where} "
-            "Each run is one Hermes agent turn, so it uses your model (and its cost) every time, "
-            "including runs that report nothing; every 5 minutes is 288 turns a day. "
-            "The job only calls klipper_watch. Removing this plugin does not remove the job."
+            f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where}{replaced} "
+            "Each run is at least one model turn, including runs that report nothing; a turn that calls a tool "
+            "makes two or more model requests. Every 5 minutes is 288 runs a day. "
+            "The job only calls klipper_watch. Removing this plugin does not remove the job; "
+            "run unschedule before removing the plugin."
         ),
         "agent_turns_per_run": 1,
         "job_id": created.get("id"),
         "deliver": deliver.strip(),
+        "replaced_job_id": old.get("id") if replaced else None,
+        "previous_deliver": old.get("deliver") if replaced else None,
     })
 
 
