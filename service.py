@@ -669,6 +669,14 @@ def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
         body["notify"] = True
         body["message"] = "klipper_watch was called with arguments, so the printer was not checked. " + body["message"]
         return dumps(body)
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+        return fail(
+            "plugin_host",
+            "plugins.isolation is host, so this process cannot see Hermes's cron mark. "
+            "This check did not report the printer as unchanged and did not update the cron watch.",
+            "Set plugins.isolation to in_process. The cron watch does not run in the plugin host.",
+            notify=True,
+        )
     if deps.data_dir is None:
         return _watch_failed(
             deps,
@@ -1019,6 +1027,12 @@ def slash_schedule_args(parts: list[str], default: str = DEFAULT_SCHEDULE) -> tu
 
 
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
+    if os.environ.get("HERMES_PLUGIN_HOST_PROCESS") == "1":
+        return fail(
+            "plugin_host",
+            "plugins.isolation is host, so this process cannot see Hermes's cron mark. No cron job was created.",
+            "Set plugins.isolation to in_process before scheduling the printer watch.",
+        )
     if not deliver.strip():
         return fail(
             "no_deliver",

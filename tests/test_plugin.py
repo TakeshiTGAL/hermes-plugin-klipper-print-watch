@@ -1062,6 +1062,19 @@ def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7
     return ctx, service_mod
 
 
+def test_plugin_host_watch_does_not_report_the_printer_unchanged(tmp_path, monkeypatch):
+    router = Router()
+    ctx, _service_mod = _load_handlers(tmp_path, router, monkeypatch)
+    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
+    body = json.loads(ctx.tools["klipper_watch"]({}))
+    assert body["ok"] is False
+    assert body["error"] == "plugin_host"
+    assert "unchanged" in body["message"]
+    assert "cron mark" in body["message"]
+    assert not (tmp_path / "watch_state.json").exists()
+    assert router.calls == []
+
+
 def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):
     import asyncio
 
