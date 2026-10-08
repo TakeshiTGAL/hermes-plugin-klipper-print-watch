@@ -397,6 +397,11 @@ def control(deps: Deps, args: dict | None = None) -> str:
         result = api.request_json("POST", f"/printer/print/{action}", timeout=CONTROL_TIMEOUT_SECONDS)
     except MoonrakerError as exc:
         note = ""
+        # A 5xx or a non-JSON body can mean the POST was received before the
+        # failure was reported. Say so, the same way a timeout or a drop does.
+        may_have_landed = exc.code in {"timeout", "network", "bad_body"} or (
+            isinstance(exc.status, int) and exc.status >= 500
+        )
         if exc.code in {"timeout", "network"}:
             try:
                 later = _print_state(api)
@@ -406,6 +411,7 @@ def control(deps: Deps, args: dict | None = None) -> str:
                 )
             except Exception:
                 note = " A later read of print_stats also failed."
+        if may_have_landed:
             note += (
                 f" The {action} command may still have reached the printer and may take effect later, "
                 "for example after a long wait command finishes."
@@ -1081,7 +1087,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "and any existing klipper-print-watch job was left as it is.",
             "Put the delivery target first, then the schedule: "
             "`/klipper-print-watch schedule telegram every 5m`, or "
-            "`klipper-print-watch schedule --deliver telegram --schedule \"every 5m\"`.",
+            "`hermes klipper-print-watch schedule --deliver telegram --schedule \"every 5m\"`.",
         )
     accepted = canonical_deliver(deliver)
     if accepted is None:

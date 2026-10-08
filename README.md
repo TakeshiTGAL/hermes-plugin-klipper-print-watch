@@ -114,8 +114,8 @@ The gateway must be running for Hermes cron (`hermes gateway`). Removing the plu
 
 - One configured origin. Tool arguments cannot replace it. Redirects: at most 2, and only to that same origin.
 - JSON reads: 10 seconds, 1000000 bytes, no retries.
-- Pause, resume, and cancel: one state read, then 60 seconds, no retries, then another state read. A timeout, or a connection drop after the POST, is not a successful move: the command may still have reached the printer and take effect later, so the reply says to read status before sending it again. A later state, when one could be read, is information only.
-- While the printer is executing a long wait command (for example a temperature wait, or a dwell), cancel may not take effect immediately. If Moonraker does not answer within 60 seconds, the connection drops after the POST, or a later read does not show the expected state, this plugin does not report success.
+- Pause, resume, and cancel: one state read, then 60 seconds, no retries, then another state read. A timeout, a connection drop after the POST, an HTTP 5xx response, or a body that is not JSON is not a successful move: the command may still have reached the printer and take effect later, so the reply says to read status before sending it again. A later state, when one could be read, is information only. An HTTP 4xx JSON error is a failure and does not use that sentence.
+- While the printer is executing a long wait command (for example a temperature wait, or a dwell), cancel may not take effect immediately. If Moonraker does not answer within 60 seconds, the connection drops after the POST, Moonraker returns HTTP 5xx or a body that is not JSON, or a later read does not show the expected state, this plugin does not report success.
 - Snapshot download: 15 seconds.
 - No Moonraker daily cap. The schedule is the cap on unattended checks, and each check is at least one model turn (288 runs a day at the default schedule).
 - Before a pause, resume, or cancel is sent, the approval prompt can wait up to `approvals.timeout` (default 300 seconds).
@@ -129,7 +129,7 @@ The agent can call the tools itself. Tools are on for every surface, including g
 
 What is stored: filename, print state, Klipper state, progress, file position, timestamps, the last watch failure code, and up to 20 stills. Not the API key and not the chat user's name.
 
-There is no Moonraker daily cap. There is no child process, and this plugin is not a sandbox for untrusted code. A control call first waits for the approval prompt (up to `approvals.timeout`, default 300 seconds), then reads `print_stats`, waits up to 60 seconds for the action, then reads `print_stats` again. A timeout is not a successful move. Vision, when enabled, adds one model call of up to 30 seconds. Seeing `print_stats.state` change does not prove the toolhead followed the command.
+There is no Moonraker daily cap. There is no child process, and this plugin is not a sandbox for untrusted code. A control call first waits for the approval prompt (up to `approvals.timeout`, default 300 seconds), then reads `print_stats`, waits up to 60 seconds for the action, then reads `print_stats` again. A timeout, an HTTP 5xx response, or a body that is not JSON is not a successful move. Vision, when enabled, adds one model call of up to 30 seconds. Seeing `print_stats.state` change does not prove the toolhead followed the command.
 
 Cron runs with nobody at the keyboard; it only watches. Each run is at least one model turn; a turn that calls a tool makes two or more model requests (288 runs a day at the default `*/5 * * * *`). An unreachable printer is reported on the first failed run, when the cause changes, and once a day while it continues, then once when it is reachable again. Removing the plugin does not remove the cron job, which keeps firing and costing a turn; run `hermes klipper-print-watch unschedule` first. `tests/` is in this repository and `register()` does not load it.
 

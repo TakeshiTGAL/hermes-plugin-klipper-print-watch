@@ -1,6 +1,7 @@
 """Klipper print watch for Hermes, built on the Moonraker HTTP API."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 
 def register(ctx) -> None:
@@ -160,8 +161,13 @@ def register(ctx) -> None:
             "Ask the agent to call klipper_control so that tool can request approval."
         )
 
+    # The default executor is process-wide. Keep slash work on a pool of 2
+    # so a burst of commands cannot fill it and stall unrelated to_thread calls.
+    slash_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="klipper-print-watch-slash")
+
     async def _slash(raw_args: str) -> str:
-        return await asyncio.to_thread(_slash_sync, raw_args)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(slash_executor, _slash_sync, raw_args)
 
     ctx.register_command(
         "klipper-print-watch",

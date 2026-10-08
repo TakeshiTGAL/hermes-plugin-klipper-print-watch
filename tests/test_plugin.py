@@ -238,6 +238,7 @@ def test_control_does_not_treat_an_error_body_as_success(tmp_path):
     out = json.loads(control(deps(tmp_path, router), {"action": "cancel"}))
     assert out["ok"] is False and out["moved"] is False
     assert "shutdown" in out["message"]
+    assert "may still have reached" not in out["message"]
 
 
 def test_live_approval_refuses_when_hermes_checks_cannot_load(tmp_path, monkeypatch):
@@ -961,6 +962,7 @@ def test_slash_schedule_refuses_a_schedule_word_as_the_deliver_target(tmp_path, 
     assert out["ok"] is False and out["error"] == "deliver_looks_like_schedule"
     assert "/klipper-print-watch schedule telegram every 5m" in out["next_step"]
     assert "--deliver telegram" in out["next_step"]
+    assert 'hermes klipper-print-watch schedule --deliver telegram --schedule "every 5m"' in out["next_step"]
     assert jobs.created == [] and jobs.removed == []
     assert [job["id"] for job in jobs.jobs] == ["old1"]
 
@@ -1019,6 +1021,43 @@ def test_control_disconnect_after_post_says_the_command_may_still_arrive(tmp_pat
     router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}))
     out = json.loads(control(deps(tmp_path, router), {"action": "cancel"}))
     assert out["moved"] is False
+    assert "may still have reached the printer and may take effect later" in out["message"]
+
+
+def test_control_http_500_says_the_command_may_still_arrive(tmp_path):
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}))
+    router.add("/printer/print/cancel", 500, env_error("Internal Server Error", "boom", 500))
+    out = json.loads(control(deps(tmp_path, router), {"action": "cancel"}))
+    assert out["ok"] is False and out["moved"] is False
+    assert out["error"] == "moonraker"
+    assert "may still have reached the printer and may take effect later" in out["message"]
+    assert "do not send it again yet" in out["next_step"]
+
+
+def test_control_non_json_body_says_the_command_may_still_arrive(tmp_path):
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}))
+    router.add("/printer/print/pause", 200, b"not-json", headers={"content-type": "text/plain"})
+    out = json.loads(control(deps(tmp_path, router), {"action": "pause"}))
+    assert out["ok"] is False and out["moved"] is False
+    assert out["error"] == "bad_body"
+    assert "may still have reached the printer and may take effect later" in out["message"]
+    assert "do not send it again yet" in out["next_step"]
+
+
+def test_control_http_500_html_says_the_command_may_still_arrive(tmp_path):
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}))
+    router.add(
+        "/printer/print/pause",
+        502,
+        b"<html>bad gateway</html>",
+        headers={"content-type": "text/html"},
+    )
+    out = json.loads(control(deps(tmp_path, router), {"action": "pause"}))
+    assert out["ok"] is False and out["moved"] is False
+    assert out["error"] == "bad_body"
     assert "may still have reached the printer and may take effect later" in out["message"]
 
 
@@ -1263,6 +1302,25 @@ def test_slash_does_not_move_the_printer(tmp_path, monkeypatch):
     assert "klipper_control" in text
     assert router.calls == []
     assert asyncio.iscoroutinefunction(ctx.command)
+
+
+def test_slash_uses_a_small_dedicated_executor(tmp_path, monkeypatch):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    async def shared_pool(*_args, **_kwargs):
+        raise AssertionError("slash used the shared default executor")
+
+    monkeypatch.setattr(asyncio, "to_thread", shared_pool)
+    ctx, _service_mod = _load_handlers(tmp_path, Router(), monkeypatch)
+    pools = [
+        cell.cell_contents
+        for cell in ctx.command.__closure__ or ()
+        if isinstance(cell.cell_contents, ThreadPoolExecutor)
+    ]
+    assert len(pools) == 1 and pools[0]._max_workers in (1, 2)
+    text = asyncio.run(ctx.command("pause"))
+    assert "does not move the printer" in text
 
 
 def test_v0214_dispatch_awaits_a_slow_slash_without_blocking_the_loop(tmp_path, monkeypatch):
