@@ -941,7 +941,7 @@ def _cron(deps: Deps):
         raise MoonrakerError(
             "no_cron",
             f"Hermes cron is not available ({type(exc).__name__}).",
-            next_step="Create the job with `hermes cron create` using a schedule no faster than every 2 minutes, deliver set explicitly, and the watch prompt from the README. Do not point that job at klipper_control.",
+            next_step="No job was created. Run schedule again after Hermes cron can be loaded. Do not point a job at klipper_control.",
         ) from None
 
 
@@ -1058,7 +1058,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "and any existing klipper-print-watch job was left as it is.",
             "Put the delivery target first, then the schedule: "
             "`/klipper-print-watch schedule telegram every 5m`, or "
-            "`hermes klipper-print-watch schedule --deliver telegram --schedule \"every 5m\"`.",
+            "`klipper-print-watch schedule --deliver telegram --schedule \"every 5m\"`.",
         )
     accepted = canonical_deliver(deliver)
     if accepted is None:
@@ -1092,7 +1092,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
                     "moved": False,
                     "message": (
                         f"Scheduled new job {created.get('id')}, but the previous job {old.get('id')} "
-                        "is still there. Remove the previous one with `hermes cron list`. Watch state was not deleted."
+                        "is still there. Remove that previous job before relying on the new one. Watch state was not deleted."
                     ),
                     "job_id": created.get("id"),
                     "deliver": deliver.strip(),
@@ -1111,7 +1111,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             if previous != target else f", which also delivered to {target}."
         )
     if target == "local":
-        where = "saved on this machine only (`hermes cron list`). It is not sent to a chat."
+        where = "saved on this machine only. It is not sent to a chat."
     else:
         where = (
             f"marked for delivery to {target}. Hermes sends that only when the platform is already configured. "
@@ -1149,7 +1149,7 @@ def unschedule(deps: Deps) -> str:
     except MoonrakerError as exc:
         return fail(exc.code, exc.message, exc.next_step)
     except Exception as exc:
-        return fail("no_cron", f"Could not remove the job ({type(exc).__name__}).", "Use `hermes cron list` and remove the klipper-print-watch job there.")
+        return fail("no_cron", f"Could not remove the job ({type(exc).__name__}).", "Remove the klipper-print-watch job from the cron list, then run unschedule again if it is still there.")
     return dumps({
         "ok": True,
         "moved": False,

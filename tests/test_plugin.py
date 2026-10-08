@@ -416,6 +416,7 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path):
     assert jobs.created[0]["enabled_toolsets"] == ["klipper_print_watch"]
     assert "Do not call klipper_control" in jobs.created[0]["prompt"]
     assert "not sent to a chat" in made["message"]
+    assert "hermes cron" not in made["message"]
     for expr in ("2m", "every 2m", "every 5m", "in 30m", "*/2 * * * *", "0 0 * * * *"):
         slow = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), expr, "telegram"))
         assert slow["ok"] is True, expr
