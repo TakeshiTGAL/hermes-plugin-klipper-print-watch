@@ -260,6 +260,19 @@ def test_watch_records_a_baseline_without_calling_it_the_first_print(tmp_path):
     assert out["events"] == []
     assert "first print" not in out["message"].lower()
     assert "No earlier sample" in out["message"]
+    assert (tmp_path / "watch_state.json").is_file()
+
+
+def test_manual_first_check_does_not_say_it_recorded_a_baseline(tmp_path):
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result(PRINTING))
+    router.add("/server/files/metadata", 200, ok_result({}))
+    out = json.loads(watch(deps(tmp_path, router), {}, advance=False))
+    assert out["ok"] is True and out["state_saved"] is False and out["events"] == []
+    assert not (tmp_path / "watch_state.json").exists()
+    assert "records the current state" not in out["message"]
+    assert "records the current state" not in out["note"]
+    assert "did not record a baseline" in out["message"]
 
 
 def test_watch_notifies_completion_once_and_keeps_state_if_the_file_is_corrupt(tmp_path):
@@ -1009,6 +1022,29 @@ def test_control_disconnect_after_post_says_the_command_may_still_arrive(tmp_pat
     assert "may still have reached the printer and may take effect later" in out["message"]
 
 
+def test_homeassistant_follows_this_hermes_delivery_list(tmp_path, monkeypatch):
+    import service as service_mod
+
+    assert "homeassistant" not in service_mod._DELIVER_PLATFORMS
+    jobs = _KeptJobs()
+    real_names = service_mod._known_deliver_platforms
+    monkeypatch.setattr(service_mod, "_known_deliver_platforms", lambda: set(service_mod._DELIVER_PLATFORMS))
+    refused = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", "homeassistant"))
+    assert refused["ok"] is False and refused["error"] == "bad_deliver" and jobs.created == []
+
+    fake = types.ModuleType("cron.scheduler_delivery")
+    fake._KNOWN_DELIVERY_PLATFORMS = frozenset({"homeassistant", "cli"})
+    pkg = types.ModuleType("cron")
+    pkg.scheduler_delivery = fake
+    monkeypatch.setattr(service_mod, "_known_deliver_platforms", real_names)
+    monkeypatch.setitem(sys.modules, "cron", pkg)
+    monkeypatch.setitem(sys.modules, "cron.scheduler_delivery", fake)
+    names = service_mod._known_deliver_platforms()
+    assert "homeassistant" in names and "cli" not in names and "telegram" in names
+    accepted = json.loads(schedule(deps(tmp_path, Router(), cron_module=_KeptJobs()), "every 5m", "homeassistant"))
+    assert accepted["ok"] is True and accepted["deliver"] == "homeassistant"
+
+
 @pytest.mark.parametrize("target", ["cli", "cron", "api_server", "telegarm", "bot-chat:"])
 def test_unknown_deliver_targets_are_refused(tmp_path, target):
     jobs = _KeptJobs()
@@ -1123,6 +1159,18 @@ def test_plugin_host_watch_does_not_report_the_printer_unchanged(tmp_path, monke
         "local",
     ))
     assert allowed["ok"] is True and len(jobs.created) == 1
+
+
+def test_unreadable_cron_mark_does_not_watch_or_stay_quiet(tmp_path, monkeypatch):
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result(PRINTING))
+    ctx, service_mod = _load_handlers(tmp_path, router, monkeypatch)
+    monkeypatch.setattr(service_mod, "_is_cron_turn", lambda: None)
+    body = json.loads(ctx.tools["klipper_watch"]({}))
+    assert body["ok"] is False and body["notify"] is True and body["error"] == "cron_mark_unreadable"
+    assert "unchanged" in body["message"] and "No new event" not in body["message"]
+    assert router.calls == []
+    assert not (tmp_path / "watch_state.json").exists()
 
 
 def test_manual_paths_do_not_consume_a_cron_event(tmp_path, monkeypatch):

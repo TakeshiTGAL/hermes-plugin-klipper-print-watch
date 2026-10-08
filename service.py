@@ -587,16 +587,20 @@ def _failure_file_mark(path: Path) -> str | None:
     return f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
 
 
-def _is_cron_turn() -> bool:
-    """True only when Hermes says this turn is cron. A missing helper does not count as cron."""
+def _is_cron_turn() -> bool | None:
+    """True when Hermes says this turn is cron, False when it says it is not.
+
+    None when the helper cannot be read. That is not the same as "not cron":
+    a missing answer must not advance the watch and must not look like a quiet check.
+    """
     try:
         from tools.approval_context import _is_cron_approval_context
     except Exception:
-        return False
+        return None
     try:
         return _is_cron_approval_context() is True
     except Exception:
-        return False
+        return None
 
 
 def _watch_failed(deps: Deps, code: str, message: str, next_step: str, *, advance: bool = True) -> str:
@@ -713,6 +717,11 @@ def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
     recovered = _clear_failure(deps) if advance else None
     sample = watch_state.sample_from_status(body["printer_objects"])
     new_state, events, note = watch_state.compare(prev, sample, deps.now(), deps.stall_minutes)
+    if not advance and note == "No earlier sample is stored, so this check only records the current state.":
+        note = (
+            "No earlier sample is stored. This check did not write the cron watch, "
+            "so it did not record a baseline."
+        )
     unreadable_note = None
     failure_path, _record, unreadable = _failure_record(deps)
     if unreadable and failure_path is not None:
@@ -973,15 +982,29 @@ def _target_looks_like_schedule(target: str) -> bool:
         return False
 
 
-# Union of Hermes v0.21.4 and current main cron delivery platforms. cli, cron, and
-# api_server are not in either list. homeassistant is only in v0.21.4.
+# Platforms both v0.21.4 and current main deliver to. A name that exists on only
+# one of those (homeassistant on v0.21.4) is added from this process's
+# cron.scheduler_delivery._KNOWN_DELIVERY_PLATFORMS, not from the other version.
+# cli, cron, and api_server are not delivery targets.
 _DELIVER_PLATFORMS = frozenset({
     "telegram", "discord", "slack", "whatsapp", "signal",
-    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+    "matrix", "mattermost", "dingtalk", "feishu",
     "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
     "qqbot", "yuanbao",
 })
 _DELIVER_SPECIAL = frozenset({"local", "origin", "all"})
+_NEVER_DELIVER = frozenset({"cli", "cron", "api_server"})
+
+
+def _known_deliver_platforms() -> set[str]:
+    """Names this Hermes process can deliver to, plus platforms a loaded plugin registered."""
+    names = set(_DELIVER_PLATFORMS)
+    try:
+        from cron.scheduler_delivery import _KNOWN_DELIVERY_PLATFORMS
+        names.update(str(name).strip().lower() for name in _KNOWN_DELIVERY_PLATFORMS if str(name).strip())
+    except Exception:
+        pass
+    return (names | _extra_platform_names()) - _NEVER_DELIVER
 
 
 def _extra_platform_names() -> set[str]:
@@ -1001,7 +1024,7 @@ def canonical_deliver(value: str) -> str | None:
     parts = [part.strip() for part in value.split(",")]
     if not parts or any(not part for part in parts):
         return None
-    known = _DELIVER_PLATFORMS | _extra_platform_names()
+    known = _known_deliver_platforms()
     kept: list[str] = []
     for part in parts:
         low = part.lower()

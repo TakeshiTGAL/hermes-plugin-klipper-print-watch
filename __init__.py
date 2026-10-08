@@ -51,7 +51,18 @@ def register(ctx) -> None:
             from . import service as svc
         else:
             import service as svc
-        return watch(_deps(), args or {}, advance=svc._is_cron_turn())
+        if svc.in_plugin_host_process():
+            return watch(_deps(), args or {}, advance=False)
+        turn = svc._is_cron_turn()
+        if turn is None:
+            return svc.fail(
+                "cron_mark_unreadable",
+                "This process cannot tell whether it is a cron turn. "
+                "This check did not report the printer as unchanged and did not update the cron watch.",
+                "Run it where tools.approval_context can be loaded. Nothing was written.",
+                notify=True,
+            )
+        return watch(_deps(), args or {}, advance=turn)
 
     ctx.register_tool(
         name="klipper_status",
