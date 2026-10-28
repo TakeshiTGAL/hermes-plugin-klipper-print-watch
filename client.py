@@ -125,6 +125,25 @@ def _scrub(text: str, api_key: str) -> str:
     return text
 
 
+def _request_has_api_key(req) -> bool:
+    """True when this request would send X-Api-Key. A missing request is unkeyed."""
+    if req is None:
+        return False
+    getter = getattr(req, "get_header", None)
+    if callable(getter):
+        try:
+            if getter("X-api-key"):
+                return True
+        except Exception:
+            pass
+    headers = getattr(req, "headers", None)
+    if isinstance(headers, dict):
+        for key, value in headers.items():
+            if str(key).lower() == "x-api-key" and value:
+                return True
+    return False
+
+
 class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
     def __init__(self, origin: Origin):
         super().__init__()
@@ -132,6 +151,16 @@ class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
         self.hops = 0
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _request_has_api_key(req):
+            raise MoonrakerError(
+                "redirect",
+                "Moonraker redirected a request that carries the API key.",
+                status=code,
+                next_step=(
+                    "Point MOONRAKER_URL at the final origin. "
+                    "This plugin will not follow a redirect on a keyed request."
+                ),
+            )
         self.hops += 1
         if self.hops > MAX_REDIRECTS or not same_origin(self.origin, newurl):
             raise MoonrakerError(
@@ -152,7 +181,9 @@ def _urllib_transport(origin: Origin) -> Transport:
                 next_step="Snapshot and API URLs must stay on MOONRAKER_URL.",
             )
         redirect = _SameOriginRedirect(origin)
-        opener = urllib.request.build_opener(redirect)
+        # ProxyHandler({}) replaces urllib's default, so an environment proxy does not
+        # receive the API key.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), redirect)
         req = urllib.request.Request(url, data=body, method=method, headers=dict(headers))
         try:
             with opener.open(req, timeout=timeout) as resp:

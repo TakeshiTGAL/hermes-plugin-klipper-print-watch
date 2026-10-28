@@ -1,15 +1,19 @@
 """Klipper print watch for Hermes, built on the Moonraker HTTP API."""
 
 import asyncio
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 
 def register(ctx) -> None:
     if __package__:
+        from .client import parse_origin
+        from .safety import on_pre_tool_call, set_origin_getter
         from .service import (
             DEFAULT_SCHEDULE,
             TOOLSET,
             Deps,
+            bind_cron_reader,
             control,
             deps_from_config,
             schedule,
@@ -19,10 +23,13 @@ def register(ctx) -> None:
             watch,
         )
     else:
+        from client import parse_origin
+        from safety import on_pre_tool_call, set_origin_getter
         from service import (
             DEFAULT_SCHEDULE,
             TOOLSET,
             Deps,
+            bind_cron_reader,
             control,
             deps_from_config,
             schedule,
@@ -33,19 +40,20 @@ def register(ctx) -> None:
         )
 
     def _deps() -> Deps:
-        import os
+        from agent.secret_scope import get_secret
+
         return deps_from_config(
             ctx.get_config,
-            url=os.environ.get("MOONRAKER_URL", ""),
-            api_key=os.environ.get("MOONRAKER_API_KEY", ""),
+            url=get_secret("MOONRAKER_URL") or "",
+            api_key=get_secret("MOONRAKER_API_KEY") or "",
             llm=ctx.llm,
         )
 
     def _status(args, **_kwargs):
         return status(_deps(), args or {})
 
-    def _control(args, **_kwargs):
-        return control(_deps(), args or {})
+    def _control(args, **kwargs):
+        return control(_deps(), args or {}, **kwargs)
 
     def _watch(args, **_kwargs):
         if __package__:
@@ -60,7 +68,7 @@ def register(ctx) -> None:
                 "cron_mark_unreadable",
                 "This process cannot tell whether it is a cron turn. "
                 "This check did not report the printer as unchanged and did not update the cron watch.",
-                "Run it where tools.approval_context can be loaded. Nothing was written.",
+                "Run it in the conversation process, where the cron mark can be read. Nothing was written.",
                 notify=True,
             )
         return watch(_deps(), args or {}, advance=turn)
@@ -71,11 +79,13 @@ def register(ctx) -> None:
         schema={
             "name": "klipper_status",
             "description": (
-                "Read one Klipper printer through the configured Moonraker URL. "
+                "Klipper printer: read progress and temperatures. "
                 "Returns print state, progress, extruder and bed temperatures, and a slicer remaining-time "
                 "estimate when file metadata has estimated_time. Does not move the printer. "
-                "include_snapshot saves one webcam still only after Hermes's write guard allows it. "
-                "include_files counts the gcode list. Neither flag can change the URL."
+                "include_snapshot saves one webcam still only inside the plugin data directory. "
+                "include_files counts the gcode list. Neither flag can change the URL. "
+                "It reads a 3D printer through Moonraker; the extruder temperature is the hotend (nozzle) "
+                "temperature, reported with the bed temperature so you can monitor the print job."
             ),
             "parameters": {
                 "type": "object",
@@ -94,10 +104,12 @@ def register(ctx) -> None:
         schema={
             "name": "klipper_control",
             "description": (
-                "Pause, resume, or cancel the configured printer. Asks Hermes for approval on every call; "
-                "an earlier session or always answer is not reused. "
-                "Does nothing if approval is missing, if this is cron, yolo, approvals off, an unattended session, "
-                "or a plugins.isolation host process, or if that check cannot be loaded. "
+                "Klipper printer: pause, resume, or cancel the job. "
+                "Pause, resume, or cancel the configured printer. "
+                "Hermes shows one pre_tool_call line and asks before the POST. "
+                "always applies only to this same action at this same origin, and only while a person is here. "
+                "Hermes yolo and approvals off skip that prompt. "
+                "Cron, hermes -q, webhook, and a plugins.isolation host process refuse the move, including after always. "
                 "Sends the action only when print_stats.state is not already "
                 "the result, and reports a move only when a later read shows the state changed. "
                 "Refuses any other action, including G-code and temperature changes."
@@ -119,7 +131,7 @@ def register(ctx) -> None:
         schema={
             "name": "klipper_watch",
             "description": (
-                "Compare the printer with the previous sample. Reports klippy_shutdown, complete, error, paused, cancelled, and stalled. "
+                "Klipper printer: report a finished or failed print. Reports klippy_shutdown, complete, error, paused, cancelled, and stalled. "
                 "klippy_shutdown means Klipper itself stopped (webhooks.state shutdown or error), printing or not; "
                 "it is not reported as paused. "
                 "paused is reported only when the previous state was printing and Klipper is still running. "
@@ -128,7 +140,7 @@ def register(ctx) -> None:
                 "Only stalled uses this test: while printing, file_position is a number, and file_position, progress, and the filename all stayed the same for stall_minutes. A missing file_position is not a stall. "
                 "Does not move the printer. "
                 "A chat, slash, or CLI check does not update the cron watch. Only a cron turn writes watch_state.json and the failure record. "
-                "Takes no arguments. Vision, if enabled in config, is one model call on a cron turn and still does not cancel."
+                "Vision, if enabled in config, is one model call on a cron turn and still does not cancel."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -167,7 +179,9 @@ def register(ctx) -> None:
 
     async def _slash(raw_args: str) -> str:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(slash_executor, _slash_sync, raw_args)
+        # The pool worker does not see this task's contextvars. Copy the profile
+        # secret scope (and the Hermes home override) into the worker.
+        return await loop.run_in_executor(slash_executor, contextvars.copy_context().run, _slash_sync, raw_args)
 
     ctx.register_command(
         "klipper-print-watch",
@@ -206,6 +220,33 @@ def register(ctx) -> None:
         handler_fn=_cli,
         description="Read Moonraker and schedule a watch. Pause, resume, and cancel stay on the tool, which asks for approval.",
     )
+    try:
+        from pathlib import Path
+        ctx.register_skill(
+            "klipper-printer",
+            Path(__file__).resolve().parent / "skills" / "klipper-printer" / "SKILL.md",
+            description=(
+                "Klipper printer progress, temperatures, and Moonraker. "
+                "Before web_search, use tool_search to find the Klipper tools and tool_call to run them."
+            ),
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("klipper skill was not registered", exc_info=True)
+
+    def _origin() -> str:
+        from agent.secret_scope import get_secret
+
+        raw = get_secret("MOONRAKER_URL") or ""
+        try:
+            return parse_origin(raw).base
+        except Exception:
+            return raw if isinstance(raw, str) else ""
+
+    set_origin_getter(_origin)
+    if hasattr(ctx, "current_cron_execution"):
+        bind_cron_reader(ctx.current_cron_execution)
+    ctx.register_hook("pre_tool_call", on_pre_tool_call)
 
 
 __all__ = ["register"]

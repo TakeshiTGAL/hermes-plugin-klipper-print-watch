@@ -105,6 +105,57 @@ def test_redirect_off_origin_is_refused():
     assert caught.value.code == "off_origin"
 
 
+def test_keyed_redirect_is_refused_even_on_the_same_origin():
+    import urllib.request
+
+    handler = _SameOriginRedirect(parse_origin("http://printer.local:7125"))
+    req = urllib.request.Request(
+        "http://printer.local:7125/printer/info",
+        headers={"X-Api-Key": "secret"},
+    )
+    with pytest.raises(MoonrakerError) as caught:
+        handler.redirect_request(
+            req, None, 302, "found", {}, "http://printer.local:7125/server/info",
+        )
+    assert caught.value.code == "redirect"
+    assert handler.hops == 0
+
+
+def test_unkeyed_same_origin_redirect_is_followed():
+    import urllib.request
+
+    handler = _SameOriginRedirect(parse_origin("http://printer.local:7125"))
+    req = urllib.request.Request("http://printer.local:7125/printer/info")
+    nxt = handler.redirect_request(
+        req, None, 302, "found", {}, "http://printer.local:7125/server/info",
+    )
+    assert nxt is not None
+    assert nxt.full_url.startswith("http://printer.local:7125/")
+
+
+def _install_platform_registry(monkeypatch, entries):
+    gateway_pkg = types.ModuleType("gateway")
+    gateway_pkg.__path__ = []
+    registry_mod = types.ModuleType("gateway.platform_registry")
+
+    class Registry:
+        def registered_names(self):
+            return list(entries)
+
+        def get(self, name):
+            if name not in entries:
+                return None
+
+            class Entry:
+                cron_deliver_env_var = entries[name]
+
+            return Entry()
+
+    registry_mod.platform_registry = Registry()
+    monkeypatch.setitem(sys.modules, "gateway", gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", registry_mod)
+
+
 def test_status_uses_only_the_configured_origin_and_hides_the_key(tmp_path):
     router = Router()
     router.add("/printer/objects/query", 200, ok_result(PRINTING))
@@ -241,13 +292,14 @@ def test_control_does_not_treat_an_error_body_as_success(tmp_path):
     assert "may still have reached" not in out["message"]
 
 
-def test_live_approval_refuses_when_hermes_checks_cannot_load(tmp_path, monkeypatch):
-    monkeypatch.setattr(safety, "_load", lambda _module, _name: ("failed", None))
+def test_unapproved_move_sends_nothing(tmp_path):
+    safety._STASH.clear()
     router = Router()
     router.add("/printer/print/pause", 200, ok_result("ok"))
     out = json.loads(control(deps(tmp_path, router, approver=None), {"action": "pause"}))
     assert out["moved"] is False and out["message"].startswith("BLOCKED:")
     assert router.calls == []
+    safety._STASH.clear()
 
 
 def test_watch_records_a_baseline_without_calling_it_the_first_print(tmp_path):
@@ -403,36 +455,96 @@ def test_vision_does_not_move_the_printer(tmp_path, monkeypatch):
     assert not any("/printer/print/" in call["url"] for call in router.calls)
 
 
-def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path):
-    class Jobs:
-        def __init__(self):
-            self.created = []
+class CronCLI:
+    """Stdout stand-in for `hermes cron list`, `create`, and `remove`."""
 
-        def list_jobs(self, include_disabled=True):
-            return []
+    def __init__(self, jobs=None):
+        self.jobs = [dict(job) for job in (jobs or [])]
+        self.created = []
+        self.removed = []
+        self.argv = []
+        self._seq = 0
 
-        def create_job(self, **kwargs):
-            self.created.append(kwargs)
-            return {"id": "abc", "schedule_display": kwargs["schedule"]}
+    def __call__(self, argv):
+        self.argv.append(list(argv))
+        if "list" in argv:
+            return self._result(0, self._list_text(), "")
+        if "create" in argv:
+            return self._create(argv)
+        if "remove" in argv:
+            return self._remove(argv)
+        return self._result(1, "", "unknown cron command")
 
-        def remove_job(self, job_id):
-            raise AssertionError(job_id)
+    @staticmethod
+    def _result(code, stdout, stderr):
+        from types import SimpleNamespace
+        return SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr)
 
-    jobs = Jobs()
-    missing = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "*/5 * * * *", ""))
+    def _list_text(self):
+        if not self.jobs:
+            return "No scheduled jobs.\n"
+        lines = ["Scheduled Jobs"]
+        for job in self.jobs:
+            lines.append(f"  {job['id']} [active]")
+            lines.append(f"    Name:      {job.get('name', '')}")
+            lines.append(f"    Deliver:   {job.get('deliver', '')}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _create(self, argv):
+        index = argv.index("create")
+        schedule_text = argv[index + 1]
+        prompt = argv[index + 2]
+        flags = {}
+        rest = argv[index + 3:]
+        cursor = 0
+        while cursor < len(rest):
+            token = rest[cursor]
+            if token.startswith("--") and cursor + 1 < len(rest):
+                flags[token[2:]] = rest[cursor + 1]
+                cursor += 2
+            else:
+                cursor += 1
+        self._seq += 1
+        job_id = f"new{self._seq}"
+        record = {
+            "id": job_id,
+            "name": flags.get("name", ""),
+            "deliver": flags.get("deliver", ""),
+            "schedule": schedule_text,
+            "prompt": prompt,
+        }
+        self.created.append(record)
+        self.jobs.append({"id": job_id, "name": record["name"], "deliver": record["deliver"]})
+        return self._result(0, f"Created job: {job_id}\n  Name: {record['name']}\n  Schedule: {schedule_text}\n", "")
+
+    def _remove(self, argv):
+        job_id = argv[argv.index("remove") + 1]
+        self.removed.append(job_id)
+        self.jobs = [job for job in self.jobs if job["id"] != job_id]
+        return self._result(0, f"Removed job: {job_id}\n", "")
+
+
+def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path, monkeypatch):
+    _install_platform_registry(monkeypatch, {"telegram": "TELEGRAM_BOT_TOKEN"})
+    jobs = CronCLI()
+    missing = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "*/5 * * * *", ""))
     assert missing["ok"] is False and jobs.created == []
     for expr in ("* * * * *", "1m", "every 1m", "0-59 * * * *", "* * * * * *", "0 * * * * *", "every 30s", "every monday 9am"):
-        fast = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), expr, "local"))
+        fast = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), expr, "local"))
         assert fast["ok"] is False and fast["error"] == "schedule_too_fast", expr
     assert jobs.created == []
-    made = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "*/5 * * * *", "local"))
+    made = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "*/5 * * * *", "local"))
     assert made["ok"] is True
-    assert jobs.created[0]["enabled_toolsets"] == ["klipper_print_watch"]
+    create_argv = next(argv for argv in jobs.argv if "create" in argv)
+    assert "enabled_toolsets" not in create_argv
+    assert create_argv[create_argv.index("--name") + 1] == "klipper-print-watch"
     assert "Do not call klipper_control" in jobs.created[0]["prompt"]
     assert "not sent to a chat" in made["message"]
-    assert "hermes cron" not in made["message"]
+    assert "hermes cron create" in made["message"]
+    assert "cannot set enabled_toolsets" in made["message"]
     for expr in ("2m", "every 2m", "every 5m", "in 30m", "*/2 * * * *", "0 0 * * * *"):
-        slow = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), expr, "telegram"))
+        slow = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), expr, "telegram"))
         assert slow["ok"] is True, expr
         assert "does not check that the chat exists" in slow["message"]
 
@@ -440,40 +552,24 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path):
 def test_unschedule_keeps_the_state_file(tmp_path):
     path = tmp_path / "watch_state.json"
     path.write_text('{"version": 1}', encoding="utf-8")
-
-    class Jobs:
-        def list_jobs(self, include_disabled=True):
-            return [{"name": "klipper-print-watch", "id": "job1"}]
-
-        def remove_job(self, job_id):
-            assert job_id == "job1"
-
-    out = json.loads(unschedule(deps(tmp_path, Router(), cron_module=Jobs())))
+    jobs = CronCLI(jobs=[{"name": "klipper-print-watch", "id": "job1", "deliver": "local"}])
+    out = json.loads(unschedule(deps(tmp_path, Router(), cron_run=jobs)))
+    assert jobs.removed == ["job1"]
     assert out["ok"] is True
     assert path.read_text(encoding="utf-8") == '{"version": 1}'
 
 
-def test_missing_session_gate_refuses_before_http(tmp_path, monkeypatch):
-    def fake(module, name):
-        if name == "_is_single_query_approval_context":
-            return "missing", None
-        if name == "_is_cron_approval_context":
-            return "ok", (lambda: False)
-        if name == "_yolo_active":
-            return "ok", (lambda: False)
-        if name == "_get_approval_mode":
-            return "ok", (lambda: "manual")
-        if name == "_is_unattended_platform_approval_context":
-            return "ok", (lambda: False)
-        return "failed", None
-
-    monkeypatch.setattr(safety, "_load", fake)
+def test_session_mode_is_not_a_plugin_block(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
+    safety._STASH.clear()
+    assert safety.motion_block_reason("pause") is None
     router = Router()
     router.add("/printer/print/pause", 200, ok_result("ok"))
     out = json.loads(control(deps(tmp_path, router, approver=None), {"action": "pause"}))
     assert out["moved"] is False
-    assert "single-query" in out["message"]
-    assert router.calls == []
+    assert "single-query" not in out["message"]
+    assert not any("/printer/print/" in call["url"] for call in router.calls)
+    safety._STASH.clear()
 
 
 def test_snapshot_over_the_cap_or_cut_short_is_not_saved(tmp_path):
@@ -568,6 +664,9 @@ def test_register_matches_the_manifest():
 
         def get_config(self, key, default=None):
             return default
+
+        def register_hook(self, name, callback):
+            return None
 
         llm = None
 
@@ -665,40 +764,6 @@ def test_status_message_says_klipper_stopped(tmp_path):
     assert "Klipper has stopped: MCU 'mcu' shutdown: Timer too close." in out["message"]
 
 
-class _FakeHermes:
-    """tools.approval / tools.approval_context with Hermes's allowlist rule:
-    a session or always answer pre-approves the same pattern_key without asking again."""
-
-    def __init__(self, answer: str):
-        self.answer = answer
-        self.asked = []
-        self.allowlist = set()
-
-    def request_tool_approval(self, tool_name, reason, *, rule_key="", approval_callback=None):
-        key = f"plugin_rule:{rule_key}"
-        if key in self.allowlist:
-            return {"approved": True, "message": None}
-        self.asked.append({"tool": tool_name, "reason": reason, "rule_key": rule_key})
-        if self.answer in {"session", "always"}:
-            self.allowlist.add(key)
-        return {"approved": True, "message": None}
-
-    def install(self, monkeypatch):
-        approval = types.ModuleType("tools.approval")
-        approval.request_tool_approval = self.request_tool_approval
-        approval._yolo_active = lambda: False
-        context = types.ModuleType("tools.approval_context")
-        context._is_cron_approval_context = lambda: False
-        context._get_approval_mode = lambda: "manual"
-        context._is_single_query_approval_context = lambda: False
-        context._is_unattended_platform_approval_context = lambda: False
-        tools = types.ModuleType("tools")
-        monkeypatch.setitem(sys.modules, "tools", tools)
-        monkeypatch.setitem(sys.modules, "tools.approval", approval)
-        monkeypatch.setitem(sys.modules, "tools.approval_context", context)
-        monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
-
-
 def _moving_router() -> Router:
     router = Router()
     router.add("/printer/objects/query", 200, ok_result({"status": {"print_stats": {"state": "printing"}}}), times=1)
@@ -707,45 +772,52 @@ def _moving_router() -> Router:
     return router
 
 
-@pytest.mark.parametrize("answer", ["always", "session"])
-def test_always_or_session_does_not_skip_the_next_approval(tmp_path, monkeypatch, answer):
-    hermes = _FakeHermes(answer)
-    hermes.install(monkeypatch)
-    first = json.loads(control(deps(tmp_path, _moving_router(), approver=None), {"action": "pause"}))
-    second = json.loads(control(deps(tmp_path, _moving_router(), approver=None), {"action": "pause"}))
-    assert first["moved"] is True and second["moved"] is True
-    assert len(hermes.asked) == 2
-    keys = [item["rule_key"] for item in hermes.asked]
-    assert keys[0] != keys[1]
-    assert all(key.startswith("klipper_control:pause:") for key in keys)
-
-
-def test_approval_text_names_the_printer_the_call_and_the_argument(tmp_path, monkeypatch):
-    hermes = _FakeHermes("once")
-    hermes.install(monkeypatch)
-    control(deps(tmp_path, _moving_router(), approver=None), {"action": "pause"})
-    reason = hermes.asked[0]["reason"]
+def test_approval_text_names_the_printer_the_call_and_the_argument():
+    reason = safety.approval_text("pause", "http://printer.local:7125")
     assert "http://printer.local:7125" in reason
     assert "POST /printer/print/pause" in reason
     assert "action=pause" in reason
     assert SECRET not in reason
+    assert "\n" not in reason
 
 
-def test_plugin_host_process_refuses_motion_before_asking_or_http(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"HERMES_CRON_SESSION": "1"},
+        {"HERMES_SINGLE_QUERY_SESSION": "1"},
+        {"HERMES_SESSION_PLATFORM": "webhook"},
+        {"HERMES_SESSION_PLATFORM": "api_server"},
+    ],
+)
+def test_unattended_env_posts_nothing_even_when_the_approver_says_yes(tmp_path, monkeypatch, env):
+    for key in ("HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_PLATFORM"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    router = _moving_router()
+    out = json.loads(control(deps(tmp_path, router), {"action": "pause"}))
+    assert out["moved"] is False
+    assert "including after always" in out["message"]
+    assert not any("/printer/print/" in call["url"] for call in router.calls)
+
+
+def test_plugin_host_process_refuses_motion_before_http(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
+    assert safety.motion_block_reason("pause") is None
     for value in ("1", "true"):
-        hermes = _FakeHermes("once")
-        hermes.install(monkeypatch)
         monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", value)
         router = _moving_router()
         out = json.loads(control(deps(tmp_path, router, approver=None), {"action": "cancel"}))
         assert out["moved"] is False
         assert out["message"].startswith("BLOCKED:") and "plugins.isolation: host" in out["message"]
-        assert hermes.asked == [] and router.calls == []
-    hermes = _FakeHermes("once")
-    hermes.install(monkeypatch)
+        assert router.calls == []
     monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "0")
-    out = json.loads(control(deps(tmp_path, _moving_router(), approver=None), {"action": "pause"}))
-    assert out["moved"] is True and hermes.asked
+    assert safety.motion_block_reason("pause") is None
+    router = _moving_router()
+    out = json.loads(control(deps(tmp_path, router), {"action": "pause"}))
+    assert out["moved"] is True
+    assert any("/printer/print/pause" in call["url"] for call in router.calls)
 
 
 def test_unreachable_printer_notifies_once_then_stays_quiet_then_says_it_is_back(tmp_path):
@@ -801,16 +873,9 @@ def test_corrupt_state_file_is_reported_once(tmp_path):
 def test_cron_prompt_handles_failures_and_schedule_discloses_agent_turns(tmp_path):
     from service import CRON_PROMPT
 
-    class Jobs:
-        def list_jobs(self, include_disabled=True):
-            return []
-
-        def create_job(self, **kwargs):
-            return {"id": "abc", "schedule_display": kwargs["schedule"]}
-
     assert "[SILENT]" in CRON_PROMPT
     assert "did not run" in CRON_PROMPT
-    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=Jobs()), "*/5 * * * *", "local"))
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_run=CronCLI()), "*/5 * * * *", "local"))
     assert "at least one model turn" in out["message"] and "288" in out["message"]
     assert out["agent_turns_per_run"] == 1
 
@@ -931,34 +996,16 @@ def test_a_continuing_failure_is_reported_again_after_24_hours(tmp_path):
     assert back["recovered"] is True and back["notify"] is True
 
 
-class _KeptJobs:
-    """Fake cron.jobs with one existing klipper-print-watch job delivering to telegram."""
-
-    def __init__(self):
-        self.jobs = [{"name": "klipper-print-watch", "id": "old1", "deliver": "telegram"}]
-        self.created = []
-        self.removed = []
-
-    def list_jobs(self, include_disabled=True):
-        return list(self.jobs)
-
-    def create_job(self, **kwargs):
-        self.created.append(kwargs)
-        job = {"id": f"new{len(self.created)}", "name": kwargs["name"], "deliver": kwargs["deliver"],
-               "schedule_display": kwargs["schedule"]}
-        self.jobs.append(job)
-        return job
-
-    def remove_job(self, job_id):
-        self.removed.append(job_id)
-        self.jobs = [job for job in self.jobs if job["id"] != job_id]
+def _KeptJobs():
+    """One existing klipper-print-watch job delivering to telegram."""
+    return CronCLI(jobs=[{"name": "klipper-print-watch", "id": "old1", "deliver": "telegram"}])
 
 
 @pytest.mark.parametrize("line", ["schedule every 5m", "schedule 5m", "schedule in 30m", "schedule weekdays", "schedule weekends"])
 def test_slash_schedule_refuses_a_schedule_word_as_the_deliver_target(tmp_path, line):
     jobs = _KeptJobs()
     when, deliver = slash_schedule_args(line.split())
-    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), when, deliver))
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), when, deliver))
     assert out["ok"] is False and out["error"] == "deliver_looks_like_schedule"
     assert "/klipper-print-watch schedule telegram every 5m" in out["next_step"]
     assert "--deliver telegram" in out["next_step"]
@@ -970,16 +1017,20 @@ def test_slash_schedule_refuses_a_schedule_word_as_the_deliver_target(tmp_path, 
 @pytest.mark.parametrize("target", ["mon", "*/5", "@hourly", "2026-10-08T09:00", "daily", "10:30"])
 def test_other_schedule_shapes_are_refused_as_deliver_targets(tmp_path, target):
     jobs = _KeptJobs()
-    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", target))
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", target))
     assert out["error"] == "deliver_looks_like_schedule"
     assert jobs.created == []
 
 
 @pytest.mark.parametrize("target", ["telegram", "discord:123", "local", "origin"])
-def test_real_deliver_targets_still_schedule(tmp_path, target):
+def test_real_deliver_targets_still_schedule(tmp_path, target, monkeypatch):
+    _install_platform_registry(monkeypatch, {
+        "telegram": "TELEGRAM_BOT_TOKEN",
+        "discord": "DISCORD_BOT_TOKEN",
+    })
     jobs = _KeptJobs()
     when, deliver = slash_schedule_args(["schedule", target, "every", "5m"])
-    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), when, deliver))
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), when, deliver))
     assert out["ok"] is True, out
     assert jobs.created[0]["deliver"] == target and jobs.created[0]["schedule"] == "every 5m"
     assert jobs.removed == ["old1"]
@@ -1061,42 +1112,64 @@ def test_control_http_500_html_says_the_command_may_still_arrive(tmp_path):
     assert "may still have reached the printer and may take effect later" in out["message"]
 
 
-def test_homeassistant_follows_this_hermes_delivery_list(tmp_path, monkeypatch):
+def test_homeassistant_follows_the_public_delivery_registry(tmp_path, monkeypatch):
     import service as service_mod
 
-    assert "homeassistant" not in service_mod._DELIVER_PLATFORMS
+    _install_platform_registry(monkeypatch, {})
     jobs = _KeptJobs()
-    real_names = service_mod._known_deliver_platforms
-    monkeypatch.setattr(service_mod, "_known_deliver_platforms", lambda: set(service_mod._DELIVER_PLATFORMS))
-    refused = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", "homeassistant"))
+    refused = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", "homeassistant"))
     assert refused["ok"] is False and refused["error"] == "bad_deliver" and jobs.created == []
+    assert service_mod._known_deliver_platforms() == set()
 
-    fake = types.ModuleType("cron.scheduler_delivery")
-    fake._KNOWN_DELIVERY_PLATFORMS = frozenset({"homeassistant", "cli"})
-    pkg = types.ModuleType("cron")
-    pkg.scheduler_delivery = fake
-    monkeypatch.setattr(service_mod, "_known_deliver_platforms", real_names)
-    monkeypatch.setitem(sys.modules, "cron", pkg)
-    monkeypatch.setitem(sys.modules, "cron.scheduler_delivery", fake)
+    _install_platform_registry(monkeypatch, {
+        "homeassistant": "HOMEASSISTANT_TOKEN",
+        "cli": "",
+        "telegram": "TELEGRAM_BOT_TOKEN",
+    })
     names = service_mod._known_deliver_platforms()
+    assert names is not None
     assert "homeassistant" in names and "cli" not in names and "telegram" in names
-    accepted = json.loads(schedule(deps(tmp_path, Router(), cron_module=_KeptJobs()), "every 5m", "homeassistant"))
+    accepted = json.loads(schedule(deps(tmp_path, Router(), cron_run=_KeptJobs()), "every 5m", "homeassistant"))
     assert accepted["ok"] is True and accepted["deliver"] == "homeassistant"
+
+
+def test_unreadable_delivery_registry_refuses_platform_names(tmp_path, monkeypatch):
+    import builtins
+
+    import service as service_mod
+
+    real_import = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "gateway.platform_registry" or (
+            name == "gateway" and fromlist and "platform_registry" in fromlist
+        ):
+            raise ImportError("registry unreadable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.delitem(sys.modules, "gateway.platform_registry", raising=False)
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    assert service_mod._known_deliver_platforms() is None
+    jobs = _KeptJobs()
+    refused = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", "telegram"))
+    assert refused["ok"] is False and refused["error"] == "bad_deliver" and jobs.created == []
+    kept = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", "local"))
+    assert kept["ok"] is True
 
 
 @pytest.mark.parametrize("target", ["cli", "cron", "api_server", "telegarm", "bot-chat:"])
 def test_unknown_deliver_targets_are_refused(tmp_path, target):
     jobs = _KeptJobs()
-    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", target))
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", target))
     assert out["ok"] is False and out["error"] == "bad_deliver"
     assert jobs.created == []
 
 
 def test_bot_chat_deliver_says_it_starts_a_model_turn(tmp_path):
     jobs = _KeptJobs()
-    out = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", "origin,all"))
+    out = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", "origin,all"))
     assert out["ok"] is True and out["deliver"] == "origin,all"
-    chat = json.loads(schedule(deps(tmp_path, Router(), cron_module=jobs), "every 5m", "bot-chat"))
+    chat = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), "every 5m", "bot-chat"))
     assert chat["ok"] is True
     assert "one model turn" in chat["message"]
     assert "agent can act" in chat["message"]
@@ -1108,12 +1181,14 @@ def _cancelled_body() -> bytes:
     return ok_result(cancelled)
 
 
-def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7125", use_router=True):
+def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7125", use_router=True, set_env=True, pass_key=False):
     import importlib.util
 
+    pytest.importorskip("agent.secret_scope")
     root = Path(__file__).resolve().parents[1]
-    monkeypatch.setenv("MOONRAKER_URL", url)
-    monkeypatch.delenv("MOONRAKER_API_KEY", raising=False)
+    if set_env:
+        monkeypatch.setenv("MOONRAKER_URL", url)
+        monkeypatch.delenv("MOONRAKER_API_KEY", raising=False)
     spec = importlib.util.spec_from_file_location(
         "klipper_fix2_plugin",
         root / "__init__.py",
@@ -1142,6 +1217,9 @@ def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7
         def get_config(self, key, default=None):
             return default
 
+        def register_hook(self, name, callback):
+            return None
+
         llm = None
 
     ctx = Ctx()
@@ -1151,28 +1229,26 @@ def _load_handlers(tmp_path, router, monkeypatch, *, url="http://printer.local:7
     monkeypatch.setattr(service_mod, "plugin_data_dir", lambda: tmp_path)
     monkeypatch.setattr(service_mod, "write_guard_error", lambda _path: None)
     if use_router:
-        monkeypatch.setattr(
-            service_mod,
-            "_client",
-            lambda deps: client_mod.Moonraker(client_mod.parse_origin(deps.url), transport=router),
-        )
+        if pass_key:
+            monkeypatch.setattr(
+                service_mod,
+                "_client",
+                lambda deps: client_mod.Moonraker(
+                    client_mod.parse_origin(deps.url), deps.api_key, transport=router,
+                ),
+            )
+        else:
+            monkeypatch.setattr(
+                service_mod,
+                "_client",
+                lambda deps: client_mod.Moonraker(client_mod.parse_origin(deps.url), transport=router),
+            )
     return ctx, service_mod
 
 
 def test_plugin_host_watch_does_not_report_the_printer_unchanged(tmp_path, monkeypatch):
     router = Router()
     ctx, service_mod = _load_handlers(tmp_path, router, monkeypatch)
-
-    class Jobs:
-        def __init__(self):
-            self.created = []
-
-        def list_jobs(self, include_disabled=True):
-            return []
-
-        def create_job(self, **kwargs):
-            self.created.append(kwargs)
-            return {"id": "job", "schedule_display": kwargs["schedule"]}
 
     for value in ("1", "true"):
         monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", value)
@@ -1181,9 +1257,9 @@ def test_plugin_host_watch_does_not_report_the_printer_unchanged(tmp_path, monke
         assert "unchanged" in body["message"] and "No new event" not in body["message"]
         assert "cron mark" in body["message"]
         assert not (tmp_path / "watch_state.json").exists()
-        jobs = Jobs()
+        jobs = CronCLI()
         scheduled = json.loads(service_mod.schedule(
-            service_mod.Deps(url="http://printer.local:7125", data_dir=tmp_path, cron_module=jobs),
+            service_mod.Deps(url="http://printer.local:7125", data_dir=tmp_path, cron_run=jobs),
             "*/5 * * * *",
             "local",
         ))
@@ -1191,9 +1267,9 @@ def test_plugin_host_watch_does_not_report_the_printer_unchanged(tmp_path, monke
         assert jobs.created == []
     assert router.calls == []
     monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "0")
-    jobs = Jobs()
+    jobs = CronCLI()
     allowed = json.loads(service_mod.schedule(
-        service_mod.Deps(url="http://printer.local:7125", data_dir=tmp_path, cron_module=jobs),
+        service_mod.Deps(url="http://printer.local:7125", data_dir=tmp_path, cron_run=jobs),
         "*/5 * * * *",
         "local",
     ))
@@ -1359,3 +1435,187 @@ def test_v0214_dispatch_awaits_a_slow_slash_without_blocking_the_loop(tmp_path, 
     ran, text = asyncio.run(run())
     assert ran is True and started["value"] is True
     assert "could not check" in text or "not JSON" in text or "ok" in text
+
+
+_MISSING_URL = "MOONRAKER_URL is not set."
+_ENV_READ = __import__("re").compile(
+    r"""os\s*\.\s*(?:getenv\s*\(|environ\s*\.\s*get\s*\(|environ\s*\[\s*)\s*['\"](?:MOONRAKER_URL|MOONRAKER_API_KEY)['\"]"""
+)
+
+
+def _release_scope(scope, token):
+    if token is not None:
+        try:
+            scope.reset_secret_scope(token)
+        except ValueError:
+            pass
+    scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+
+
+def test_scope_value_is_used_when_environ_differs(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MOONRAKER_URL", "http://env.example:7125")
+    monkeypatch.setenv("MOONRAKER_API_KEY", "env-key")
+    router = Router()
+    router.add("printer.local", 200, ok_result(PRINTING))
+    ctx, _service_mod = _load_handlers(
+        tmp_path, router, monkeypatch, set_env=False, pass_key=True,
+    )
+    token = scope.set_secret_scope({
+        "MOONRAKER_URL": "http://printer.local:7125",
+        "MOONRAKER_API_KEY": "scope-key",
+    })
+    try:
+        ctx.tools["klipper_status"]({})
+    finally:
+        _release_scope(scope, token)
+    assert router.calls
+    assert router.calls[0]["headers"].get("X-Api-Key") == "scope-key"
+    assert "env.example" not in router.calls[0]["url"]
+    assert all(call["headers"].get("X-Api-Key") != "env-key" for call in router.calls)
+
+
+@pytest.mark.parametrize("slash_args", ["status", "watch"])
+def test_slash_multiplex_uses_scope_value(tmp_path, monkeypatch, slash_args):
+    import asyncio
+
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MOONRAKER_URL", "http://env.example:7125")
+    monkeypatch.setenv("MOONRAKER_API_KEY", "env-key")
+    monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
+    router = Router()
+    router.add("/printer/objects/query", 200, ok_result(PRINTING))
+    router.add("/server/files/metadata", 404, env_error("Unknown", "missing", 404))
+    ctx, _service_mod = _load_handlers(
+        tmp_path, router, monkeypatch, set_env=False, pass_key=True,
+    )
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({
+        "MOONRAKER_URL": "http://printer.local:7125",
+        "MOONRAKER_API_KEY": "scope-key",
+    })
+    try:
+        raw = asyncio.run(ctx.command(slash_args))
+    finally:
+        _release_scope(scope, token)
+    body = json.loads(raw)
+    assert body["ok"] is True
+    assert "UnscopedSecretError" not in raw
+    assert router.calls
+    assert router.calls[0]["headers"].get("X-Api-Key") == "scope-key"
+    assert "env.example" not in router.calls[0]["url"]
+    assert "env-key" not in raw
+    assert all(call["headers"].get("X-Api-Key") != "env-key" for call in router.calls)
+
+
+def test_multiplex_scope_miss_does_not_read_environ(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MOONRAKER_URL", "http://env.example:7125")
+    monkeypatch.setenv("MOONRAKER_API_KEY", "env-key")
+    ctx, _service_mod = _load_handlers(tmp_path, None, monkeypatch, set_env=False, use_router=False)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({"UNRELATED": "present"})
+    try:
+        raw = ctx.tools["klipper_status"]({})
+    finally:
+        _release_scope(scope, token)
+    body = json.loads(raw)
+    assert body["ok"] is False and body["error"] == "missing_url"
+    assert body["message"] == _MISSING_URL
+    assert "env.example" not in raw
+    assert "env-key" not in raw
+
+
+def test_unscoped_multiplex_raises_and_does_not_call_upstream(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("MOONRAKER_URL", "http://env.example:7125")
+    monkeypatch.setenv("MOONRAKER_API_KEY", "env-key")
+    router = Router()
+    router.add("printer.local", 200, ok_result(PRINTING))
+    ctx, _service_mod = _load_handlers(
+        tmp_path, router, monkeypatch, set_env=False, pass_key=True,
+    )
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope(None)
+    try:
+        with pytest.raises(scope.UnscopedSecretError):
+            ctx.tools["klipper_status"]({})
+    finally:
+        _release_scope(scope, token)
+    assert router.calls == []
+
+
+def test_unset_credentials_keep_the_fixed_error(tmp_path, monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.delenv("MOONRAKER_URL", raising=False)
+    monkeypatch.delenv("MOONRAKER_API_KEY", raising=False)
+    cleared = scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+    ctx, _service_mod = _load_handlers(tmp_path, None, monkeypatch, set_env=False, use_router=False)
+    try:
+        body = json.loads(ctx.tools["klipper_status"]({}))
+    finally:
+        _release_scope(scope, cleared)
+    assert body["ok"] is False and body["error"] == "missing_url"
+    assert body["message"] == _MISSING_URL
+
+
+def test_plugin_code_does_not_read_moonraker_from_environ():
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted(root.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        assert _ENV_READ.search(text) is None, path.name
+
+
+def test_opener_ignores_https_proxy(monkeypatch):
+    import socket
+    import urllib.request
+
+    import client
+
+    passed = []
+    real_build = urllib.request.build_opener
+
+    def spy(*handlers):
+        passed.append(handlers)
+        return real_build(*handlers)
+
+    monkeypatch.setattr(client.urllib.request, "build_opener", spy)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:8443")
+    monkeypatch.setenv("https_proxy", "http://proxy.test:8443")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.test:8443")
+    monkeypatch.setenv("http_proxy", "http://proxy.test:8443")
+    targets = []
+
+    def blocked(address, *args, **kwargs):
+        targets.append(address)
+        raise OSError("blocked")
+
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    origin = parse_origin("https://printer.example:7125")
+    try:
+        client._urllib_transport(origin)("GET", "https://printer.example:7125/server/info", {}, None, 1.0, 100)
+    except Exception:
+        pass
+    proxies = [handler for handler in passed[0] if isinstance(handler, urllib.request.ProxyHandler)]
+    assert len(proxies) == 1 and proxies[0].proxies == {}
+    assert targets
+    hosts = [item[0] if isinstance(item, tuple) else item for item in targets]
+    assert hosts[0] == "printer.example"
+    assert "proxy.test" not in hosts
+
+
+def test_still_path_must_stay_inside_plugin_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(safety, "plugin_data_dir", lambda: tmp_path)
+    inside = tmp_path / "stills" / "frame.jpg"
+    inside.parent.mkdir()
+    inside.write_bytes(b"x")
+    assert safety.write_guard_error(str(inside)) is None
+    outside = tmp_path.parent / "elsewhere.jpg"
+    denied = safety.write_guard_error(str(outside))
+    assert denied and denied.startswith("BLOCKED:")
+    linked = tmp_path / "escape.jpg"
+    linked.symlink_to(outside)
+    denied_link = safety.write_guard_error(str(linked))
+    assert denied_link and denied_link.startswith("BLOCKED:")

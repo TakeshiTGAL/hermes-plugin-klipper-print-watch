@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
+import unicodedata
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -20,7 +22,15 @@ if __package__:
         MoonrakerError,
         parse_origin,
     )
-    from .safety import in_plugin_host_process, plugin_data_dir, request_motion_approval, write_guard_error
+    from .safety import (
+        approval_text,
+        in_plugin_host_process,
+        motion_block_reason,
+        plugin_data_dir,
+        reason_fits,
+        take_move,
+        write_guard_error,
+    )
     from . import watch as watch_state
 else:
     from client import (
@@ -31,7 +41,15 @@ else:
         MoonrakerError,
         parse_origin,
     )
-    from safety import in_plugin_host_process, plugin_data_dir, request_motion_approval, write_guard_error
+    from safety import (
+        approval_text,
+        in_plugin_host_process,
+        motion_block_reason,
+        plugin_data_dir,
+        reason_fits,
+        take_move,
+        write_guard_error,
+    )
     import watch as watch_state
 
 TOOLSET = "klipper_print_watch"
@@ -76,7 +94,7 @@ class Deps:
     approver: Callable[[str], tuple[bool, str]] | None = None
     write_guard: Callable[[str], str | None] | None = None
     llm: Any = None
-    cron_module: Any = None
+    cron_run: Any = None
 
 
 def dumps(payload: dict) -> str:
@@ -84,9 +102,33 @@ def dumps(payload: dict) -> str:
 
 
 def fail(code: str, message: str, next_step: str, **extra: Any) -> str:
-    body = {"ok": False, "error": code, "message": message, "next_step": next_step, "moved": False}
+    body = {
+        "ok": False, "error": code, "error_type": code,
+        "message": message, "next_step": next_step, "moved": False,
+    }
     body.update(extra)
     return dumps(body)
+
+
+def _fold_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = unicodedata.normalize("NFKC", value).strip().lower()
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+    return None
+
+
+def _fold_motion(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value).strip().lower()
+    if text in {"pause", "resume", "cancel"}:
+        return text
+    return None
 
 
 def _clamp_int(value: Any, default: int, lo: int, hi: int) -> int:
@@ -119,15 +161,10 @@ def _client(deps: Deps) -> Moonraker:
     return Moonraker(parse_origin(deps.url), deps.api_key, deps.transport)
 
 
-def _unexpected(args: dict, allowed: set[str]) -> str | None:
-    extra = sorted(set(args) - allowed)
-    if not extra:
-        return None
-    return fail(
-        "bad_args",
-        "This tool refuses arguments it does not define: " + ", ".join(extra) + ".",
-        "Call it again with only the documented arguments. A tool argument cannot change the URL, the stall time, or the vision switch.",
-    )
+def _unexpected(args: dict, allowed: set[str], message: str) -> str | None:
+    if set(args) - allowed:
+        return fail("bad_args", message, message)
+    return None
 
 
 def _heater(block: Any) -> dict[str, Any]:
@@ -317,15 +354,28 @@ def _status_message(body: dict) -> str:
     return text
 
 
+_STATUS_EXTRA = (
+    "klipper_status accepts only include_snapshot and include_files, so drop other arguments and call again, "
+    "for example include_snapshot false."
+)
+_STATUS_BOOL = (
+    "include_snapshot and include_files must be true or false, so pass a boolean or omit them, "
+    "for example include_snapshot false."
+)
+
+
 def status(deps: Deps, args: dict | None = None) -> str:
     args = dict(args or {})
-    bad = _unexpected(args, {"include_snapshot", "include_files"})
+    bad = _unexpected(args, {"include_snapshot", "include_files"}, _STATUS_EXTRA)
     if bad:
         return bad
-    if "include_snapshot" in args and not isinstance(args["include_snapshot"], bool):
-        return fail("bad_args", "include_snapshot must be a boolean.", "Pass true or false, or omit it.")
-    if "include_files" in args and not isinstance(args["include_files"], bool):
-        return fail("bad_args", "include_files must be a boolean.", "Pass true or false, or omit it.")
+    for key in ("include_snapshot", "include_files"):
+        if key not in args:
+            continue
+        folded = _fold_bool(args[key])
+        if folded is None:
+            return fail("bad_args", _STATUS_BOOL, _STATUS_BOOL)
+        args[key] = folded
     try:
         body = _status_body(deps, include_snapshot=args.get("include_snapshot") is True, include_files=args.get("include_files") is True)
     except MoonrakerError as exc:
@@ -346,30 +396,68 @@ def _print_state(api: Moonraker) -> str | None:
     return state if isinstance(state, str) else None
 
 
-def control(deps: Deps, args: dict | None = None) -> str:
+_CONTROL_EXTRA = (
+    "klipper_control accepts only action, so drop other arguments and pass pause, resume, or cancel, "
+    "for example action pause."
+)
+_CONTROL_MISSING = "action is required, so pass pause, resume, or cancel, for example action pause."
+_CONTROL_BAD = (
+    "action must be pause, resume, or cancel, so pass one of those and not a temperature, G-code, or emergency stop, "
+    "for example action pause."
+)
+
+
+def control(deps: Deps, args: dict | None = None, **kwargs: Any) -> str:
     args = dict(args or {})
-    bad = _unexpected(args, {"action"})
+    bad = _unexpected(args, {"action"}, _CONTROL_EXTRA)
     if bad:
         return bad
-    action = args.get("action")
-    if action not in {"pause", "resume", "cancel"}:
-        return fail(
-            "bad_args",
-            "action must be pause, resume, or cancel. Temperature changes, G-code, and emergency stop are refused.",
-            "Pass pause, resume, or cancel. Nothing was sent to the printer.",
-        )
+    if "action" not in args or args.get("action") in (None, ""):
+        return fail("bad_args", _CONTROL_MISSING, _CONTROL_MISSING)
+    action = _fold_motion(args.get("action"))
+    if action is None:
+        return fail("bad_args", _CONTROL_BAD, _CONTROL_BAD)
+    blocked = motion_block_reason(action)
+    if blocked:
+        if in_plugin_host_process():
+            step = "Nothing was sent. Use plugins.isolation: in_process to move the printer."
+        else:
+            step = "Nothing was sent. Run pause, resume, or cancel from a session where a person can answer."
+        return fail("not_approved", blocked, step)
     try:
         api = _client(deps)
     except MoonrakerError as exc:
         return fail(exc.code, exc.message, exc.next_step or "Nothing was sent. Do not assume the printer moved.")
+    origin = api.origin.base
+    text = approval_text(action, origin)
+    if not reason_fits(text) or "\n" in text or "`" in text:
+        return fail(
+            "approval_cut",
+            "The approval question would not fit in one message, so it was not sent and the printer was not moved.",
+            "Shorten MOONRAKER_URL. Nothing was sent.",
+        )
     try:
         if deps.approver is not None:
             allowed, why = deps.approver(action)
         else:
-            allowed, why = request_motion_approval(action, api.origin.base)
+            allowed, why = take_move(
+                args,
+                (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or "")),
+                (action, origin, text),
+            )
     except Exception:
         return fail("not_approved", "BLOCKED: the approval check failed, so the printer was not moved.", "Try again when Hermes approval is available.")
     if not allowed:
+        if "target changed" in (why or ""):
+            return dumps({
+                "ok": False,
+                "isError": True,
+                "error": "changed",
+                "error_type": "changed",
+                "message": why,
+                "next_step": "Nothing was sent.",
+                "moved": False,
+            })
         return fail("not_approved", why, "Approve the request in Hermes, or leave the printer as it is. Nothing was sent.")
     expected = {"pause": "paused", "resume": "printing", "cancel": "cancelled"}[action]
     try:
@@ -490,6 +578,27 @@ def _write_json(deps: Deps, path: Path, state: dict) -> str | None:
 _write_watch = _write_json
 
 
+def _called_at(deps: Deps) -> str:
+    try:
+        return str(deps.now())
+    except Exception:
+        return ""
+
+
+def _unknown_still(base: dict, snapshot: dict, called_at: str, reason: str) -> dict:
+    """No conclusion. The still and the time of this call are the whole report."""
+    path = snapshot.get("path") or ""
+    base["looks_failed"] = None
+    base["called_at"] = called_at
+    if reason:
+        base["reason"] = reason
+    base["message"] = (
+        "Unknown. The model cannot tell whether this still looks failed. "
+        f"Still: {path}. Called at: {called_at}."
+    )
+    return base
+
+
 def _vision(deps: Deps, snapshot: dict) -> dict[str, Any]:
     base = {
         "enabled": True,
@@ -524,15 +633,19 @@ def _vision(deps: Deps, snapshot: dict) -> dict[str, Any]:
     schema = {
         "type": "object",
         "additionalProperties": False,
-        "properties": {"looks_failed": {"type": "boolean"}, "reason": {"type": "string"}},
-        "required": ["looks_failed", "reason"],
+        "properties": {
+            "verdict": {"type": "string", "enum": ["failed", "not_failed", "unknown"]},
+            "reason": {"type": "string"},
+        },
+        "required": ["verdict", "reason"],
     }
     try:
         result = llm.complete_structured(
             instructions=(
                 "Look at this 3D-printer webcam still. "
-                "Set looks_failed true only if the print visibly looks failed (detached, spaghetti, or a clear blob). "
-                "If you cannot tell, set looks_failed false. Do not claim you stopped the printer."
+                "Set verdict to failed only if the print visibly looks failed (detached, spaghetti, or a clear blob). "
+                "Set verdict to not_failed only if you can see that the print is not failed. "
+                "If you cannot tell, set verdict to unknown. Do not claim you stopped the printer."
             ),
             input=[
                 PluginLlmTextInput(text="Webcam still from the configured printer."),
@@ -554,17 +667,32 @@ def _vision(deps: Deps, snapshot: dict) -> dict[str, Any]:
     base["output_tokens"] = getattr(usage, "output_tokens", None)
     base["cost_usd"] = getattr(usage, "cost_usd", None)
     parsed = getattr(result, "parsed", None)
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("looks_failed"), bool):
-        base["message"] = "The model did not return a boolean looks_failed. No failure verdict was recorded, and the printer was not moved."
+    called_at = _called_at(deps)
+    if not isinstance(parsed, dict):
+        base["message"] = "The model did not return a verdict. No failure verdict was recorded, and the printer was not moved."
         return base
-    base["looks_failed"] = parsed["looks_failed"]
-    base["reason"] = str(parsed.get("reason") or "")[:500]
-    base["message"] = (
-        "The model thinks the still looks failed. The printer was not moved. "
-        "Call klipper_control with action cancel only if you want Hermes to ask for approval."
-        if parsed["looks_failed"]
-        else "The model does not think the still looks failed. The printer was not moved."
-    )
+    reason = str(parsed.get("reason") or "")[:500]
+    verdict = parsed.get("verdict")
+    looks = parsed.get("looks_failed")
+    # A boolean false used to mean "cannot tell". Only the words failed and not_failed are conclusions.
+    if verdict == "unknown" or (verdict == "failed" and looks is False) or (verdict == "not_failed" and looks is True):
+        return _unknown_still(base, snapshot, called_at, reason)
+    if verdict == "failed" or (verdict is None and looks is True):
+        base["looks_failed"] = True
+        base["reason"] = reason
+        base["message"] = (
+            "The model thinks the still looks failed. The printer was not moved. "
+            "Call klipper_control with action cancel only if you want Hermes to ask for approval."
+        )
+        return base
+    if verdict == "not_failed":
+        base["looks_failed"] = False
+        base["reason"] = reason
+        base["message"] = "The model does not think the still looks failed. The printer was not moved."
+        return base
+    if looks is False or isinstance(verdict, str):
+        return _unknown_still(base, snapshot, called_at, reason)
+    base["message"] = "The model did not return a clear verdict. No failure verdict was recorded, and the printer was not moved."
     return base
 
 
@@ -593,20 +721,32 @@ def _failure_file_mark(path: Path) -> str | None:
     return f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}"
 
 
-def _is_cron_turn() -> bool | None:
-    """True when Hermes says this turn is cron, False when it says it is not.
+_cron_reader: Callable[[], Any] | None = None
 
-    None when the helper cannot be read. That is not the same as "not cron":
-    a missing answer must not advance the watch and must not look like a quiet check.
+
+def bind_cron_reader(reader: Callable[[], Any] | None) -> None:
+    """Bind the public cron mark. ``ctx.current_cron_execution`` returns None off cron."""
+    global _cron_reader
+    _cron_reader = reader
+
+
+def _is_cron_turn() -> bool | None:
+    """True on a cron turn, False on a manual turn, None when that cannot be known.
+
+    None is not the same as "not cron": a missing answer must not advance the
+    watch and must not look like a quiet check. A real None from the public
+    reader is a manual turn.
     """
-    try:
-        from tools.approval_context import _is_cron_approval_context
-    except Exception:
+    reader = _cron_reader
+    if reader is None:
         return None
     try:
-        return _is_cron_approval_context() is True
+        value = reader()
     except Exception:
         return None
+    if value is None:
+        return False
+    return True
 
 
 def _watch_failed(deps: Deps, code: str, message: str, next_step: str, *, advance: bool = True) -> str:
@@ -679,15 +819,17 @@ def _clear_failure(deps: Deps) -> str | None:
     return f"The printer watch can check the printer again (the earlier failure was {record.get('error') or 'unknown'})."
 
 
+_WATCH_ARGS = (
+    "klipper_watch takes no arguments, so the printer was not checked, and the next call should be an empty object, "
+    "for example {}."
+)
+
+
 def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
     args = dict(args or {})
-    bad = _unexpected(args, set())
-    if bad:
+    if args:
         # A wrong call, not a printer problem: never part of the failure record.
-        body = json.loads(bad)
-        body["notify"] = True
-        body["message"] = "klipper_watch was called with arguments, so the printer was not checked. " + body["message"]
-        return dumps(body)
+        return fail("bad_args", _WATCH_ARGS, _WATCH_ARGS, notify=True)
     if in_plugin_host_process():
         return fail(
             "plugin_host",
@@ -946,18 +1088,85 @@ def _schedule_refusal(expr: str) -> str | None:
     return "This plugin could not prove that schedule waits at least 2 minutes, so no job was created."
 
 
-def _cron(deps: Deps):
-    if deps.cron_module is not None:
-        return deps.cron_module
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _Cmd:
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _plain(text: str) -> str:
+    return _ANSI.sub("", text or "")
+
+
+def _hermes_bin() -> str:
+    return shutil.which("hermes") or "hermes"
+
+
+def _run_hermes_cron(deps: Deps, args: list[str]) -> _Cmd:
+    """Run ``hermes cron``. ``deps.cron_run`` replaces the child process in tests."""
+    argv = [_hermes_bin(), "cron", *args]
+    runner = deps.cron_run
+    if runner is not None:
+        done = runner(argv)
+        return _Cmd(int(done.returncode), str(done.stdout or ""), str(done.stderr or ""))
+    import subprocess
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
     try:
-        from cron import jobs
-        return jobs
-    except Exception as exc:
-        raise MoonrakerError(
-            "no_cron",
-            f"Hermes cron is not available ({type(exc).__name__}).",
-            next_step="No job was created. Run schedule again after Hermes cron can be loaded. Do not point a job at klipper_control.",
-        ) from None
+        done = subprocess.run(argv, capture_output=True, text=True, env=env)
+    except OSError as exc:
+        return _Cmd(127, "", f"Could not run hermes ({type(exc).__name__}).")
+    return _Cmd(int(done.returncode), done.stdout or "", done.stderr or "")
+
+
+def _cron_error(done: _Cmd, fallback: str) -> str:
+    line = _plain(done.stderr or done.stdout).strip().splitlines()
+    detail = line[0].strip() if line else fallback
+    if len(detail) > 180:
+        detail = detail[:179] + "…"
+    return detail or fallback
+
+
+def _parse_created_id(stdout: str) -> str | None:
+    match = re.search(r"Created job:\s*(\S+)", _plain(stdout))
+    return match.group(1) if match else None
+
+
+def _parse_listed_jobs(stdout: str) -> list[dict[str, str]]:
+    jobs: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in _plain(stdout).splitlines():
+        head = re.match(r"^  (\S+) \[", line)
+        if head:
+            if current is not None:
+                jobs.append(current)
+            current = {"id": head.group(1), "name": "", "deliver": ""}
+            continue
+        if current is None:
+            continue
+        name = re.match(r"^\s+Name:\s*(.*)$", line)
+        if name:
+            current["name"] = name.group(1).strip()
+            continue
+        deliver = re.match(r"^\s+Deliver:\s*(.*)$", line)
+        if deliver:
+            current["deliver"] = deliver.group(1).strip()
+    if current is not None:
+        jobs.append(current)
+    return jobs
+
+
+def _cron_fail(done: _Cmd, fallback: str) -> str:
+    return fail(
+        "no_cron",
+        f"hermes cron failed ({done.returncode}): {_cron_error(done, fallback)}",
+        "No printer call was made. Fix hermes cron and try again. Do not point a job at klipper_control.",
+    )
 
 
 _SCHEDULE_WORDS = {
@@ -988,41 +1197,38 @@ def _target_looks_like_schedule(target: str) -> bool:
         return False
 
 
-# Platforms both v0.21.4 and current main deliver to. A name that exists on only
-# one of those (homeassistant on v0.21.4) is added from this process's
-# cron.scheduler_delivery._KNOWN_DELIVERY_PLATFORMS, not from the other version.
+# local, origin, and all are plugin destinations, not platform names.
 # cli, cron, and api_server are not delivery targets.
-_DELIVER_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
-    "matrix", "mattermost", "dingtalk", "feishu",
-    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
-})
 _DELIVER_SPECIAL = frozenset({"local", "origin", "all"})
 _NEVER_DELIVER = frozenset({"cli", "cron", "api_server"})
 
 
-def _known_deliver_platforms() -> set[str]:
-    """Names this Hermes process can deliver to, plus platforms a loaded plugin registered."""
-    names = set(_DELIVER_PLATFORMS)
-    try:
-        from cron.scheduler_delivery import _KNOWN_DELIVERY_PLATFORMS
-        names.update(str(name).strip().lower() for name in _KNOWN_DELIVERY_PLATFORMS if str(name).strip())
-    except Exception:
-        pass
-    return (names | _extra_platform_names()) - _NEVER_DELIVER
+def _known_deliver_platforms() -> set[str] | None:
+    """Platforms already registered for cron delivery.
 
-
-def _extra_platform_names() -> set[str]:
-    """Platforms a loaded plugin registered. Import failures mean none, not every name."""
+    None when that registry cannot be read. A name counts only when its entry
+    has a cron delivery env var. An unreadable registry is not a frozen list.
+    """
     try:
         from gateway.platform_registry import platform_registry
     except Exception:
-        return set()
+        return None
     try:
-        return {str(name).strip().lower() for name in platform_registry.registered_names() if str(name).strip()}
+        listed = list(platform_registry.registered_names())
     except Exception:
-        return set()
+        return None
+    found: set[str] = set()
+    for name in listed:
+        text = str(name).strip().lower()
+        if not text or text in _NEVER_DELIVER:
+            continue
+        try:
+            entry = platform_registry.get(text)
+        except Exception:
+            return None
+        if entry is not None and getattr(entry, "cron_deliver_env_var", None):
+            found.add(text)
+    return found
 
 
 def canonical_deliver(value: str) -> str | None:
@@ -1031,6 +1237,8 @@ def canonical_deliver(value: str) -> str | None:
     if not parts or any(not part for part in parts):
         return None
     known = _known_deliver_platforms()
+    if known is None:
+        known = set()
     kept: list[str] = []
     for part in parts:
         low = part.lower()
@@ -1105,31 +1313,45 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             refusal,
             "Use 5m, */5 * * * *, or another schedule this plugin can prove is at least 2 minutes. Nothing was created.",
         )
-    try:
-        jobs = _cron(deps)
-        old = next((job for job in jobs.list_jobs(include_disabled=True) if job.get("name") == JOB_NAME), None)
-        created = jobs.create_job(
-            prompt=CRON_PROMPT, schedule=when, name=JOB_NAME, deliver=deliver.strip(),
-            enabled_toolsets=[TOOLSET],
+    listed = _run_hermes_cron(deps, ["list", "--all"])
+    if listed.returncode != 0:
+        return _cron_fail(listed, "hermes cron list failed, so no job was created.")
+    olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME]
+    old = olds[0] if olds else None
+    created_cmd = _run_hermes_cron(deps, [
+        "create", when, CRON_PROMPT, "--name", JOB_NAME, "--deliver", deliver.strip(),
+    ])
+    if created_cmd.returncode != 0:
+        return _cron_fail(created_cmd, "hermes cron create failed, so no job was created.")
+    created_id = _parse_created_id(created_cmd.stdout)
+    if not created_id:
+        return fail(
+            "no_cron",
+            "hermes cron create finished without a job id, so this plugin will not claim the job exists.",
+            "Run hermes cron list and remove any half-created klipper-print-watch job before trying again.",
         )
-        if old and old.get("id") and old.get("id") != created.get("id"):
-            try:
-                jobs.remove_job(old["id"])
-            except Exception:
-                return dumps({
-                    "ok": True,
-                    "moved": False,
-                    "message": (
-                        f"Scheduled new job {created.get('id')}, but the previous job {old.get('id')} "
-                        "is still there. Remove that previous job before relying on the new one. Watch state was not deleted."
-                    ),
-                    "job_id": created.get("id"),
-                    "deliver": deliver.strip(),
-                })
-    except MoonrakerError as exc:
-        return fail(exc.code, exc.message, exc.next_step)
-    except Exception as exc:
-        return fail("no_cron", f"Could not schedule ({type(exc).__name__}: {exc}).", "No printer call was made. Fix the schedule and try again.")
+    created = {"id": created_id, "schedule_display": when}
+    leftover = ""
+    for previous in olds:
+        if not previous.get("id") or previous["id"] == created_id:
+            continue
+        removed = _run_hermes_cron(deps, ["remove", previous["id"]])
+        if removed.returncode != 0:
+            leftover = previous["id"]
+            break
+    if leftover:
+        return dumps({
+            "ok": True,
+            "moved": False,
+            "message": (
+                f"Scheduled new job {created_id} with hermes cron create, but the previous job {leftover} "
+                "is still there. Remove that previous job before relying on the new one. Watch state was not deleted. "
+                "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets. "
+                "Pause, resume, and cancel stay refused in that cron session, including after always."
+            ),
+            "job_id": created_id,
+            "deliver": deliver.strip(),
+        })
     target = deliver.strip()
     replaced = ""
     if old and old.get("id") and old.get("id") != created.get("id"):
@@ -1150,11 +1372,14 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         "ok": True,
         "moved": False,
         "message": (
-            f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where}{replaced} "
+            f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}) with hermes cron create. "
+            f"Results are {where}{replaced} "
+            "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets "
+            "and may include more than klipper_print_watch. The prompt tells the agent to call klipper_watch only. "
+            "Pause, resume, and cancel are refused in that cron session, including after always. "
             "Each run is at least one model turn, including runs that report nothing; a turn that calls a tool "
             "makes two or more model requests. Every 5 minutes is 288 runs a day. "
-            "The job only calls klipper_watch. Removing this plugin does not remove the job; "
-            "run unschedule before removing the plugin."
+            "Removing this plugin does not remove the job; run unschedule before removing the plugin."
             + (
                 " bot-chat delivery starts one model turn, and the agent can act on that text."
                 if "bot-chat" in deliver.lower() else ""
@@ -1169,18 +1394,25 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
 
 
 def unschedule(deps: Deps) -> str:
-    try:
-        jobs = _cron(deps)
-        old = next((job for job in jobs.list_jobs(include_disabled=True) if job.get("name") == JOB_NAME), None)
-        if not old:
-            return dumps({"ok": True, "moved": False, "message": "klipper-print-watch is not scheduled. Watch state and snapshots were left in place."})
-        jobs.remove_job(old["id"])
-    except MoonrakerError as exc:
-        return fail(exc.code, exc.message, exc.next_step)
-    except Exception as exc:
-        return fail("no_cron", f"Could not remove the job ({type(exc).__name__}).", "Remove the klipper-print-watch job from the cron list, then run unschedule again if it is still there.")
+    listed = _run_hermes_cron(deps, ["list", "--all"])
+    if listed.returncode != 0:
+        return _cron_fail(listed, "hermes cron list failed, so nothing was removed.")
+    olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME and job.get("id")]
+    if not olds:
+        return dumps({"ok": True, "moved": False, "message": "klipper-print-watch is not scheduled. Watch state and snapshots were left in place."})
+    removed_ids: list[str] = []
+    for old in olds:
+        removed = _run_hermes_cron(deps, ["remove", old["id"]])
+        if removed.returncode != 0:
+            return fail(
+                "no_cron",
+                f"Could not remove job {old['id']} ({_cron_error(removed, 'hermes cron remove failed')}).",
+                "Remove the klipper-print-watch job with hermes cron remove, then run unschedule again if it is still there.",
+            )
+        removed_ids.append(old["id"])
+    shown = ", ".join(removed_ids)
     return dumps({
         "ok": True,
         "moved": False,
-        "message": f"Removed cron job {old['id']}. Watch state and snapshots were kept. `hermes plugins remove` does not do this by itself.",
+        "message": f"Removed cron job {shown}. Watch state and snapshots were kept. `hermes plugins remove` does not do this by itself.",
     })

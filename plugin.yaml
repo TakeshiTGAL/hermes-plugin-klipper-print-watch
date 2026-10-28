@@ -1,17 +1,22 @@
 name: klipper-print-watch
-version: 0.1.0
+version: 0.1.4
 manifest_version: 2
-requires_hermes: ">=0.21.4"
+requires_hermes: ">=0.21.6"
 description: >-
   Watch a Klipper printer from Hermes, built on the Moonraker HTTP API.
   Read print state, progress, temperatures and a slicer time estimate.
-  Save a webcam still only after Hermes's write guard allows the path
-  and the download is complete and within the size cap. A short or
-  oversized body is discarded.
-  Pause, resume or cancel only after a person approves through Hermes
-  and print_stats.state then changes. If it is already that state,
-  nothing is sent. Every move asks again; a session or always answer is
-  not reused. Moves are refused under plugins.isolation host.
+  Save a webcam still only inside this plugin's data directory, and only
+  when the download is complete and within the size cap. A short or
+  oversized body is discarded. A path outside that directory is not saved.
+  Pause, resume, and cancel return one pre_tool_call approve line.
+  Hermes shows it and asks before the POST. yolo and approvals off skip
+  the prompt. Choosing always adds one command_allowlist line in config.yaml.
+  That line covers only the same action at the same Moonraker origin, and
+  only while a person is in the session. cron, hermes -q, webhook, and a
+  plugins.isolation host process still refuse the move, including after always.
+  If it is already that state, nothing is sent.
+  While the plugin is enabled, its skill adds one line to the skills index
+  of every session, including surfaces where the tools are turned off.
   A cron watch can report klippy_shutdown (Klipper itself stopped, printing
   or not), complete, error, paused (only when the previous state was
   printing and Klipper is running), cancelled, and stalled. An unreachable
@@ -28,6 +33,8 @@ provides_tools:
   - klipper_status
   - klipper_control
   - klipper_watch
+provides_hooks:
+  - pre_tool_call
 requires_env:
   - name: MOONRAKER_URL
     description: "Single Moonraker base URL, for example http://printer.example:7125. No path, query, or userinfo."
@@ -57,8 +64,10 @@ config_schema:
     label: Ask your model if a still looks failed
     description: >-
       Off by default. When true, each klipper_watch tick saves one webcam still
-      and makes one ctx.llm image call. A "looks failed" answer does not pause
-      or cancel. The printer moves only through klipper_control after approval.
+      and makes one ctx.llm image call. failed and not_failed are recorded only
+      when the model says so. If it cannot tell, the reply says so and names the
+      still and the time; that is not a pass. Nothing here pauses or cancels.
+      The printer moves only through klipper_control after approval.
   snapshot_max_bytes:
     type: int
     default: 2000000
