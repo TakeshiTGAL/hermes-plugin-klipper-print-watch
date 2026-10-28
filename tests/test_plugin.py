@@ -462,6 +462,7 @@ class CronCLI:
         self.jobs = [dict(job) for job in (jobs or [])]
         self.created = []
         self.removed = []
+        self.edited = []
         self.argv = []
         self._seq = 0
 
@@ -469,11 +470,31 @@ class CronCLI:
         self.argv.append(list(argv))
         if "list" in argv:
             return self._result(0, self._list_text(), "")
+        if "edit" in argv:
+            return self._edit(argv)
         if "create" in argv:
             return self._create(argv)
         if "remove" in argv:
             return self._remove(argv)
         return self._result(1, "", "unknown cron command")
+
+    @staticmethod
+    def _flags(tokens):
+        flags = {}
+        bools = set()
+        cursor = 0
+        while cursor < len(tokens):
+            token = tokens[cursor]
+            if token == "--no-agent":
+                bools.add("no-agent")
+                cursor += 1
+                continue
+            if token.startswith("--") and cursor + 1 < len(tokens) and not tokens[cursor + 1].startswith("--"):
+                flags[token[2:]] = tokens[cursor + 1]
+                cursor += 2
+                continue
+            cursor += 1
+        return flags, bools
 
     @staticmethod
     def _result(code, stdout, stderr):
@@ -494,17 +515,12 @@ class CronCLI:
     def _create(self, argv):
         index = argv.index("create")
         schedule_text = argv[index + 1]
-        prompt = argv[index + 2]
-        flags = {}
-        rest = argv[index + 3:]
-        cursor = 0
-        while cursor < len(rest):
-            token = rest[cursor]
-            if token.startswith("--") and cursor + 1 < len(rest):
-                flags[token[2:]] = rest[cursor + 1]
-                cursor += 2
-            else:
-                cursor += 1
+        rest = argv[index + 2:]
+        prompt = ""
+        if rest and not rest[0].startswith("--"):
+            prompt = rest[0]
+            rest = rest[1:]
+        flags, bools = self._flags(rest)
         self._seq += 1
         job_id = f"new{self._seq}"
         record = {
@@ -513,10 +529,38 @@ class CronCLI:
             "deliver": flags.get("deliver", ""),
             "schedule": schedule_text,
             "prompt": prompt,
+            "script": flags.get("script", ""),
+            "no_agent": "no-agent" in bools,
         }
         self.created.append(record)
-        self.jobs.append({"id": job_id, "name": record["name"], "deliver": record["deliver"]})
+        self.jobs.append({
+            "id": job_id,
+            "name": record["name"],
+            "deliver": record["deliver"],
+            "schedule": schedule_text,
+            "script": record["script"],
+            "no_agent": record["no_agent"],
+        })
         return self._result(0, f"Created job: {job_id}\n  Name: {record['name']}\n  Schedule: {schedule_text}\n", "")
+
+    def _edit(self, argv):
+        index = argv.index("edit")
+        job_id = argv[index + 1]
+        flags, bools = self._flags(argv[index + 2:])
+        for job in self.jobs:
+            if job["id"] != job_id:
+                continue
+            if "schedule" in flags:
+                job["schedule"] = flags["schedule"]
+            if "deliver" in flags:
+                job["deliver"] = flags["deliver"]
+            if "script" in flags:
+                job["script"] = flags["script"]
+            if "no-agent" in bools:
+                job["no_agent"] = True
+            self.edited.append(dict(job))
+            return self._result(0, f"Updated job: {job_id}\n", "")
+        return self._result(1, "", "job not found")
 
     def _remove(self, argv):
         job_id = argv[argv.index("remove") + 1]
@@ -538,13 +582,17 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path, monkeypatc
     assert made["ok"] is True
     create_argv = next(argv for argv in jobs.argv if "create" in argv)
     assert "enabled_toolsets" not in create_argv
+    assert "interpreter" not in create_argv
+    assert "--no-agent" in create_argv
+    assert create_argv[create_argv.index("--script") + 1] == "klipper-print-watch.py"
     assert create_argv[create_argv.index("--name") + 1] == "klipper-print-watch"
-    assert "Do not call klipper_control" in jobs.created[0]["prompt"]
+    assert jobs.created[0]["no_agent"] is True
+    assert jobs.created[0]["prompt"] == ""
     assert "not sent to a chat" in made["message"]
-    assert "hermes cron create" in made["message"]
-    assert "cannot set enabled_toolsets" in made["message"]
-    assert "may include more than klipper_print_watch" in made["message"]
-    assert "blocks every tool except klipper_watch" in made["message"]
+    assert "hermes cron create --no-agent --script" in made["message"]
+    assert "0 tokens" in made["message"]
+    assert "holds no tools" in made["message"]
+    assert "blocks every tool" not in made["message"]
     saved = json.loads((tmp_path / "watch_job.json").read_text(encoding="utf-8"))
     assert saved["job_id"] == made["job_id"]
     assert saved["job_name"] == "klipper-print-watch"
@@ -916,14 +964,16 @@ def test_corrupt_state_file_is_reported_once(tmp_path):
     assert (tmp_path / "watch_state.json").read_text(encoding="utf-8") == "{"
 
 
-def test_cron_prompt_handles_failures_and_schedule_discloses_agent_turns(tmp_path):
-    from service import CRON_PROMPT
+def test_schedule_says_the_run_costs_nothing_and_holds_no_tools(tmp_path):
+    from service import WATCH_SCRIPT
 
-    assert "[SILENT]" in CRON_PROMPT
-    assert "did not run" in CRON_PROMPT
+    assert "[SILENT]" not in WATCH_SCRIPT
+    assert "cron.jobs" not in WATCH_SCRIPT
+    assert "build_profile_secret_scope" in WATCH_SCRIPT
+    assert WATCH_SCRIPT.index("set_secret_scope") < WATCH_SCRIPT.index("watch_stdout")
     out = json.loads(schedule(deps(tmp_path, Router(), cron_run=CronCLI()), "*/5 * * * *", "local"))
-    assert "at least one model turn" in out["message"] and "288" in out["message"]
-    assert out["agent_turns_per_run"] == 1
+    assert "0 tokens" in out["message"] and "holds no tools" in out["message"]
+    assert out["agent_turns_per_run"] == 0
 
 
 def test_declared_size_over_the_cap_says_over_the_cap(tmp_path):
@@ -1078,13 +1128,23 @@ def test_real_deliver_targets_still_schedule(tmp_path, target, monkeypatch):
     when, deliver = slash_schedule_args(["schedule", target, "every", "5m"])
     out = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), when, deliver))
     assert out["ok"] is True, out
-    assert jobs.created[0]["deliver"] == target and jobs.created[0]["schedule"] == "every 5m"
-    assert jobs.removed == ["old1"]
-    assert out["replaced_job_id"] == "old1" and out["previous_deliver"] == "telegram"
+    assert jobs.created == []
+    assert jobs.removed == []
+    assert jobs.jobs[0]["id"] == "old1"
+    assert jobs.jobs[0]["deliver"] == target
+    assert jobs.jobs[0]["no_agent"] is True
+    assert jobs.jobs[0]["script"] == "klipper-print-watch.py"
+    assert jobs.jobs[0]["schedule"] == "every 5m"
+    assert out["job_id"] == "old1" and out["previous_deliver"] == "telegram"
+    edit_argv = next(argv for argv in jobs.argv if "edit" in argv)
+    assert "--no-agent" in edit_argv
+    assert edit_argv[edit_argv.index("--script") + 1] == "klipper-print-watch.py"
+    assert "interpreter" not in edit_argv
     if target == "telegram":
-        assert "which also delivered to telegram" in out["message"]
+        assert "still delivers to telegram" in out["message"]
     else:
-        assert "which delivered to telegram; results now go to" in out["message"]
+        assert "previously delivered to telegram" in out["message"]
+        assert f"Results now go to {target}" in out["message"]
 
 
 def test_control_timeout_says_the_command_may_still_arrive(tmp_path):

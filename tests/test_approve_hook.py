@@ -277,11 +277,12 @@ def test_register_installs_the_hook():
     assert hooked[0].__name__ == "on_pre_tool_call"
 
 
-def test_schedule_help_names_the_wider_toolset_and_the_hook_block():
+def test_schedule_help_says_the_run_costs_nothing():
     text = (ROOT / "__init__.py").read_text(encoding="utf-8")
     assert "only calls klipper_watch" not in text
-    assert "may include more than klipper_print_watch" in text
-    assert "blocks every tool except klipper_watch" in text
+    assert "blocks every tool except klipper_watch" not in text
+    assert "0 tokens" in text
+    assert "holds no tools" in text
 
 
 def test_source_does_not_import_cron_jobs():
@@ -486,7 +487,12 @@ def test_another_plugins_block_skips_the_handler(hermes, monkeypatch):
     assert "other plugin" in str(result)
 
 
-def test_watch_cron_blocks_other_tools_and_leaves_other_jobs_alone(hermes):
+def test_watch_cron_does_not_narrow_tools_and_still_blocks_motion(hermes):
+    """The script job holds no tools, so this hook does not block other tools.
+
+    Pause, resume, and cancel stay blocked on every cron run, including after always.
+    A conversation still gets an approve line.
+    """
     from cron.execution_identity import enter_cron_execution, exit_cron_execution
 
     token = enter_cron_execution(
@@ -498,17 +504,15 @@ def test_watch_cron_blocks_other_tools_and_leaves_other_jobs_alone(hermes):
         terminal, _modified = hermes._dispatch_pre_tool_call_hooks(
             "terminal", {"command": "id"}, session_id="s1", task_id="t1",
         )
-        status, _modified = hermes._dispatch_pre_tool_call_hooks(
-            "klipper_status", {}, session_id="s1", task_id="t1",
-        )
+        status = hermes._get_pre_tool_call_directive_details("klipper_status", {})
         watch = hermes._get_pre_tool_call_directive_details("klipper_watch", {})
         control, _modified = hermes._dispatch_pre_tool_call_hooks(
             "klipper_control", {"action": "pause"}, session_id="s1", task_id="t1",
         )
     finally:
         exit_cron_execution(token)
-    assert terminal and "klipper_watch" in terminal
-    assert status and "BLOCKED" in status
+    assert terminal is None
+    assert status.action is None
     assert watch.action is None
     assert control and "including after always" in control
 
@@ -521,16 +525,22 @@ def test_watch_cron_blocks_other_tools_and_leaves_other_jobs_alone(hermes):
         left, _modified = hermes._dispatch_pre_tool_call_hooks(
             "terminal", {"command": "id"}, session_id="s1", task_id="t1",
         )
-        still = hermes._get_pre_tool_call_directive_details("klipper_status", {})
+        other_control, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "klipper_control", {"action": "cancel"}, session_id="s1", task_id="t1",
+        )
     finally:
         exit_cron_execution(other)
     assert left is None
-    assert still.action is None
+    assert other_control and "including after always" in other_control
 
     chat, _modified = hermes._dispatch_pre_tool_call_hooks(
         "terminal", {"command": "id"}, session_id="s1", task_id="t1",
     )
+    chat_control = hermes._get_pre_tool_call_directive_details(
+        "klipper_control", {"action": "pause"},
+    )
     assert chat is None
+    assert chat_control.action == "approve"
 
     folder = Path(os.environ["HERMES_HOME"]) / "plugin-data" / "klipper-print-watch"
     folder.mkdir(parents=True)
@@ -547,6 +557,10 @@ def test_watch_cron_blocks_other_tools_and_leaves_other_jobs_alone(hermes):
         by_id, _modified = hermes._dispatch_pre_tool_call_hooks(
             "terminal", {"command": "id"}, session_id="s1", task_id="t1",
         )
+        saved_control, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "klipper_control", {"action": "resume"}, session_id="s1", task_id="t1",
+        )
     finally:
         exit_cron_execution(renamed)
-    assert by_id and "klipper_watch" in by_id
+    assert by_id is None
+    assert saved_control and "including after always" in saved_control

@@ -140,8 +140,8 @@ def register(ctx) -> None:
                 "other repeats are silent, and the next working check says so once. Arguments are refused and not recorded as a failure. "
                 "Only stalled uses this test: while printing, file_position is a number, and file_position, progress, and the filename all stayed the same for stall_minutes. A missing file_position is not a stall. "
                 "Does not move the printer. "
-                "A chat, slash, or CLI check does not update the cron watch. Only a cron turn writes watch_state.json and the failure record. "
-                "Vision, if enabled in config, is one model call on a cron turn and still does not cancel."
+                "A chat, slash, or CLI check does not write the cron watch. The scheduled script does, and it does not call the vision model. "
+                "Vision on this tool, if enabled, is one cron-turn model call and does not cancel."
             ),
             "parameters": {"type": "object", "properties": {}},
         },
@@ -197,11 +197,10 @@ def register(ctx) -> None:
         p = subs.add_parser(
             "schedule",
             help=(
-                "Create a Hermes cron job named klipper-print-watch. "
-                "hermes cron create cannot set enabled_toolsets, so the job uses this profile's "
-                "cron platform toolsets and may include more than klipper_print_watch. "
-                "On that job, pre_tool_call blocks every tool except klipper_watch. "
-                "Each run is at least one model turn."
+                "Create a Hermes cron job named klipper-print-watch that runs a script and does not call a model. "
+                "Each run costs 0 tokens. The unmanned run holds no tools. "
+                "Empty script output sends nothing. "
+                "Running schedule again switches an existing job to that script."
             ),
         )
         p.add_argument("--deliver", default="", help="telegram, discord, slack, local, or platform:chat_id. Required.")

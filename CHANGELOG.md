@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0
+
+Each watch run costs 0 tokens. The unmanned run holds no tools. schedule writes `<HERMES_HOME>/scripts/klipper-print-watch.py` and creates the job with `hermes cron create --no-agent --script`. An existing model job is switched with `hermes cron edit --script --no-agent`. Empty stdout sends nothing. unschedule removes the job and the script. The script binds the profile secret scope and then reads the printer URL and API key. It does not print them, and it does not call the vision model. The watch cron no longer narrows other tools in `pre_tool_call`. Pause, resume, and cancel still return approve while a person is in the session, and still return block in cron, `hermes -q`, webhook, and a plugin-host process, including after always. Cancel still uses a new `rule_key` on every call. A job made by 0.1.x keeps its model turn until the next schedule. Removing the plugin leaves that script job. Run unschedule first, or `hermes cron remove` after.
+
 ## 0.1.7
 
 `hermes klipper-print-watch schedule --help` no longer says the cron job only calls `klipper_watch`. `hermes cron create` still cannot set `enabled_toolsets`, so the job uses the profile's cron platform toolsets and can include more than `klipper_print_watch`. On a run whose job id matches the id saved under the plugin data directory, or whose job name is `klipper-print-watch`, `pre_tool_call` blocks every tool except `klipper_watch`. Another cron job and a conversation return nothing from this hook. The `hermes cron` child process stops after 60 seconds.

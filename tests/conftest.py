@@ -10,7 +10,27 @@ from __future__ import annotations
 import os
 import sys
 from contextvars import ContextVar, Token
+from pathlib import Path
 from typing import Mapping, Optional
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _hermes_home_is_a_scratch_dir(tmp_path, monkeypatch):
+    """Schedule writes a script under HERMES_HOME. Never the person's own directory."""
+    current = os.environ.get("HERMES_HOME", "").strip()
+    user_home = Path.home() / ".hermes"
+    if current:
+        try:
+            if Path(current).resolve() != user_home.resolve():
+                return
+        except OSError:
+            pass
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
 
 
 def pytest_configure(config) -> None:

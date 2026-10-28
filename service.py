@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 import unicodedata
 import urllib.parse
@@ -65,14 +66,34 @@ SNAPSHOT_KEEP = 20
 STALL_LO, STALL_HI = 1, 240
 SNAPSHOT_LO, SNAPSHOT_HI = 1, 5_000_000
 DEFAULT_SCHEDULE = "*/5 * * * *"
-CRON_PROMPT = (
-    "Call the klipper_watch tool with no arguments. "
-    "Do not call klipper_control. Do not pause, resume, cancel, change a temperature, or send G-code. "
-    "If the tool result has notify true, reply with its message field and nothing else. "
-    "If notify is false, reply with [SILENT]. "
-    "If the tool cannot be called or returns no notify field, reply with: "
-    "klipper_watch did not run, so the printer was not checked."
-)
+SCRIPT_NAME = "klipper-print-watch.py"
+# Hermes runs this file with its own Python, from HERMES_HOME/scripts, and delivers
+# stdout as the cron message. Empty stdout sends nothing. The script binds the
+# profile secret scope before watch_stdout reads the printer URL and API key.
+# The backslash-n below is the newline escape the generated file contains.
+WATCH_SCRIPT = '''"""klipper-print-watch. Hermes delivers stdout and sends nothing when it is empty."""
+import sys
+from hermes_constants import get_hermes_home
+from agent.secret_scope import build_profile_secret_scope, set_secret_scope
+
+home = get_hermes_home()
+set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+plugin = home / "plugins" / "klipper-print-watch"
+if not (plugin / "service.py").is_file():
+    print(
+        "klipper-print-watch is not installed under plugins/klipper-print-watch, so the watch did not run.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+sys.path.insert(0, str(plugin))
+import service
+
+text = service.watch_stdout()
+if text:
+    sys.stdout.write(text)
+    if not text.endswith("\\n"):
+        sys.stdout.write("\\n")
+'''
 FAILURE_FILE = "watch_failure.json"
 FAILURE_REMIND_SECONDS = 24 * 3600
 
@@ -937,6 +958,101 @@ def watch(deps: Deps, args: dict | None = None, *, advance: bool = True) -> str:
     })
 
 
+def _plugin_settings() -> dict:
+    """Plugin settings from the public config file. An unreadable file uses defaults."""
+    try:
+        from hermes_cli.config import load_config
+        raw = load_config()
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    plugins = raw.get("plugins")
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry = entries.get(JOB_NAME) if isinstance(entries, dict) else None
+    if not isinstance(entry, dict):
+        return {}
+    settings = entry.get("settings")
+    if isinstance(settings, dict):
+        return settings
+    legacy = entry.get("config")
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _deps_for_script() -> Deps:
+    """Deps for the no-agent script. The script has already bound the secret scope.
+
+    vision_check is forced off. This run does not call a model.
+    """
+    from agent.secret_scope import get_secret
+
+    settings = _plugin_settings()
+
+    def get_config(key: str, default: Any = None) -> Any:
+        if key == "vision_check":
+            return False
+        return settings[key] if key in settings else default
+
+    built = deps_from_config(
+        get_config,
+        url=get_secret("MOONRAKER_URL") or "",
+        api_key=get_secret("MOONRAKER_API_KEY") or "",
+        llm=None,
+    )
+    built.vision_check = False
+    built.llm = None
+    return built
+
+
+def _without_model(deps: Deps) -> Deps:
+    if not deps.vision_check and deps.llm is None:
+        return deps
+    return Deps(
+        url=deps.url,
+        api_key=deps.api_key,
+        data_dir=deps.data_dir,
+        stall_minutes=deps.stall_minutes,
+        vision_check=False,
+        snapshot_max_bytes=deps.snapshot_max_bytes,
+        now=deps.now,
+        transport=deps.transport,
+        approver=deps.approver,
+        write_guard=deps.write_guard,
+        llm=None,
+        cron_run=deps.cron_run,
+    )
+
+
+def _scrub_secret(text: str, secret: str) -> str:
+    if secret and secret in text:
+        return text.replace(secret, "[redacted]")
+    return text
+
+
+def watch_stdout(deps: Deps | None = None) -> str:
+    """Watch text for the no-agent script. Empty when there is nothing to send.
+
+    The script process does not share the scheduler's cron identity, so this
+    entry does not read the cron mark. klipper_watch still advances the saved
+    watch only on a cron turn. This entry does not call the vision model.
+    """
+    if deps is None:
+        deps = _deps_for_script()
+    deps = _without_model(deps)
+    raw = watch(deps, {}, advance=True)
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return "The printer watch returned a result this plugin could not read."
+    if not isinstance(payload, dict):
+        return "The printer watch returned a result this plugin could not read."
+    message = str(payload.get("message") or "").strip()
+    message = _scrub_secret(message, deps.api_key)
+    if payload.get("notify") and message:
+        return message
+    return ""
+
+
 _MONTHS = {name: index for index, name in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1,
 )}
@@ -1118,6 +1234,8 @@ def _run_hermes_cron(deps: Deps, args: list[str]) -> _Cmd:
     if runner is not None:
         done = runner(argv)
         return _Cmd(int(done.returncode), str(done.stdout or ""), str(done.stderr or ""))
+    if not os.environ.get("HERMES_HOME", "").strip():
+        return _Cmd(127, "", "HERMES_HOME is unset, so hermes cron was not started.")
     import subprocess
     env = os.environ.copy()
     env["NO_COLOR"] = "1"
@@ -1303,12 +1421,112 @@ def _forget_watch_job(deps: Deps) -> None:
         return
 
 
+def watch_script_path() -> Path | None:
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home) / "scripts" / SCRIPT_NAME
+
+
+def write_watch_script() -> str | None:
+    """Write the relative script Hermes cron will run. None means it is in place."""
+    path = watch_script_path()
+    if path is None:
+        return "HERMES_HOME is unset, so the watch script was not written."
+    payload = WATCH_SCRIPT.encode("utf-8")
+    fd = None
+    tmp = ""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".watch-", suffix=".tmp")
+        os.write(fd, payload)
+        os.close(fd)
+        fd = None
+        os.replace(tmp, path)
+        tmp = ""
+    except OSError:
+        return "The watch script could not be written, so the job was not changed."
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return None
+
+
+def remove_watch_script() -> str | None:
+    """Delete the watch script. None means it is gone, including when it was already absent."""
+    path = watch_script_path()
+    if path is None:
+        return "HERMES_HOME is unset, so the watch script was not removed."
+    if not path.is_file():
+        return None
+    try:
+        path.unlink()
+    except OSError:
+        return "The watch script could not be removed."
+    return None
+
+
+def _schedule_text(
+    *,
+    how: str,
+    when: str,
+    target: str,
+    previous: str | None,
+    leftover: str,
+) -> str:
+    if target == "local":
+        where = "saved on this machine only. It is not sent to a chat."
+    else:
+        where = (
+            f"marked for delivery to {target}. Hermes sends that only when the platform is already configured. "
+            "This plugin does not check that the chat exists."
+        )
+    switched = ""
+    if previous and previous != target:
+        switched = f" It previously delivered to {previous}. Results now go to {target}."
+    elif previous:
+        switched = f" It still delivers to {target}."
+    extra = ""
+    if leftover:
+        extra = (
+            f" The previous job {leftover} is still there. Remove that job before relying on this one. "
+            "Watch state was not deleted."
+        )
+    bot = ""
+    if "bot-chat" in target.lower():
+        bot = " bot-chat delivery starts one model turn, and the agent can act on that text."
+    return (
+        f"Scheduled {JOB_NAME} ({when}) with {how}. "
+        f"Results are {where}{switched}{extra} "
+        "Each run costs 0 tokens. The unmanned run holds no tools. "
+        "The job runs a script and does not call a model. Empty script output sends nothing. "
+        "hermes cron create cannot set a per-job tool list, which does not matter here because this job holds no tools. "
+        "interpreter is not passed. "
+        "Running schedule again switches an existing job with hermes cron edit --script --no-agent. "
+        "A job made by 0.1.x keeps its model turn until the next schedule. "
+        "This version does not narrow other tools on that leftover job. "
+        "Pause, resume, and cancel stay refused in cron, hermes -q, webhook, and a plugin-host process, including after always. "
+        "The scheduled script does not call the vision model. "
+        "Removing this plugin does not remove the job. Run unschedule before removing the plugin."
+        + bot
+    )
+
+
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
     if in_plugin_host_process():
         return fail(
             "plugin_host",
-            "plugins.isolation is host, so this process cannot see Hermes's cron mark. No cron job was created.",
-            "Set plugins.isolation to in_process before scheduling the printer watch.",
+            "plugins.isolation is host, so schedule was not run from this process. No cron job was created.",
+            "Set plugins.isolation to in_process, or run hermes klipper-print-watch schedule outside the plugin host. "
+            "The scheduled script itself is started by Hermes cron, not by the plugin host.",
         )
     if not deliver.strip():
         return fail(
@@ -1341,101 +1559,93 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             refusal,
             "Use 5m, */5 * * * *, or another schedule this plugin can prove is at least 2 minutes. Nothing was created.",
         )
+    if not os.environ.get("HERMES_HOME", "").strip():
+        return fail(
+            "no_cron",
+            "HERMES_HOME is unset, so no job was created.",
+            "Run this from Hermes so HERMES_HOME is set. Nothing was sent to the printer.",
+        )
     listed = _run_hermes_cron(deps, ["list", "--all"])
     if listed.returncode != 0:
         return _cron_fail(listed, "hermes cron list failed, so no job was created.")
-    olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME]
-    old = olds[0] if olds else None
-    created_cmd = _run_hermes_cron(deps, [
-        "create", when, CRON_PROMPT, "--name", JOB_NAME, "--deliver", deliver.strip(),
-    ])
-    if created_cmd.returncode != 0:
-        return _cron_fail(created_cmd, "hermes cron create failed, so no job was created.")
-    created_id = _parse_created_id(created_cmd.stdout)
-    if not created_id:
-        return fail(
-            "no_cron",
-            "hermes cron create finished without a job id, so this plugin will not claim the job exists.",
-            "Run hermes cron list and remove any half-created klipper-print-watch job before trying again.",
-        )
-    created = {"id": created_id, "schedule_display": when}
-    _remember_watch_job(deps, created_id)
-    leftover = ""
-    for previous in olds:
-        if not previous.get("id") or previous["id"] == created_id:
-            continue
-        removed = _run_hermes_cron(deps, ["remove", previous["id"]])
-        if removed.returncode != 0:
-            leftover = previous["id"]
-            break
-    if leftover:
-        return dumps({
-            "ok": True,
-            "moved": False,
-            "message": (
-                f"Scheduled new job {created_id} with hermes cron create, but the previous job {leftover} "
-                "is still there. Remove that previous job before relying on the new one. Watch state was not deleted. "
-                "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets "
-                "and may include more than klipper_print_watch. "
-                "On a run of this job, pre_tool_call blocks every tool except klipper_watch. "
-                "Another cron job and a conversation return nothing from this hook. "
-                "Pause, resume, and cancel stay refused in that cron session, including after always."
-            ),
-            "job_id": created_id,
-            "deliver": deliver.strip(),
-        })
+    olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME and job.get("id")]
+    script_err = write_watch_script()
+    if script_err:
+        return fail("no_cron", script_err + " No job was created.", "Nothing was sent to the printer.")
     target = deliver.strip()
-    replaced = ""
-    if old and old.get("id") and old.get("id") != created.get("id"):
-        previous = str(old.get("deliver") or "(none)")
-        replaced = f" It replaced job {old.get('id')}"
-        replaced += (
-            f", which delivered to {previous}; results now go to {target} instead."
-            if previous != target else f", which also delivered to {target}."
-        )
-    if target == "local":
-        where = "saved on this machine only. It is not sent to a chat."
+    previous = str(olds[0].get("deliver") or "") if olds else None
+    if olds:
+        job_id = olds[0]["id"]
+        edited = _run_hermes_cron(deps, [
+            "edit", job_id, "--schedule", when, "--deliver", target,
+            "--script", SCRIPT_NAME, "--no-agent",
+        ])
+        if edited.returncode != 0:
+            return _cron_fail(edited, "hermes cron edit failed, so the existing job was not changed.")
+        how = "hermes cron edit --script --no-agent"
+        extras = olds[1:]
     else:
-        where = (
-            f"marked for delivery to {target}. Hermes sends that only when the platform is already configured. "
-            "This plugin does not check that the chat exists."
-        )
+        created_cmd = _run_hermes_cron(deps, [
+            "create", when, "--name", JOB_NAME, "--deliver", target,
+            "--no-agent", "--script", SCRIPT_NAME,
+        ])
+        if created_cmd.returncode != 0:
+            remove_watch_script()
+            return _cron_fail(created_cmd, "hermes cron create failed, so no job was created.")
+        job_id = _parse_created_id(created_cmd.stdout)
+        if not job_id:
+            remove_watch_script()
+            return fail(
+                "no_cron",
+                "hermes cron create finished without a job id, so this plugin will not claim the job exists.",
+                "Run hermes cron list and remove any half-created klipper-print-watch job before trying again.",
+            )
+        how = "hermes cron create --no-agent --script"
+        extras = []
+        previous = None
+    _remember_watch_job(deps, job_id)
+    leftover = ""
+    for extra in extras:
+        removed = _run_hermes_cron(deps, ["remove", extra["id"]])
+        if removed.returncode != 0:
+            leftover = extra["id"]
+            break
     return dumps({
         "ok": True,
         "moved": False,
-        "message": (
-            f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}) with hermes cron create. "
-            f"Results are {where}{replaced} "
-            "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets "
-            "and may include more than klipper_print_watch. "
-            "On a run of this job, pre_tool_call blocks every tool except klipper_watch. "
-            "Another cron job and a conversation return nothing from this hook. "
-            "The prompt tells the agent to call klipper_watch only. "
-            "Pause, resume, and cancel are refused in that cron session, including after always. "
-            "Each run is at least one model turn, including runs that report nothing. A turn that calls a tool "
-            "makes two or more model requests. Every 5 minutes is 288 runs a day. "
-            "Removing this plugin does not remove the job; run unschedule before removing the plugin."
-            + (
-                " bot-chat delivery starts one model turn, and the agent can act on that text."
-                if "bot-chat" in deliver.lower() else ""
-            )
-        ),
-        "agent_turns_per_run": 1,
-        "job_id": created.get("id"),
-        "deliver": deliver.strip(),
-        "replaced_job_id": old.get("id") if replaced else None,
-        "previous_deliver": old.get("deliver") if replaced else None,
+        "message": _schedule_text(how=how, when=when, target=target, previous=previous, leftover=leftover),
+        "agent_turns_per_run": 0,
+        "job_id": job_id,
+        "deliver": target,
+        "script": SCRIPT_NAME,
+        "previous_deliver": previous,
     })
 
 
 def unschedule(deps: Deps) -> str:
+    if not os.environ.get("HERMES_HOME", "").strip():
+        return fail(
+            "no_cron",
+            "HERMES_HOME is unset, so nothing was removed.",
+            "Run this from Hermes so HERMES_HOME is set.",
+        )
     listed = _run_hermes_cron(deps, ["list", "--all"])
     if listed.returncode != 0:
         return _cron_fail(listed, "hermes cron list failed, so nothing was removed.")
     olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME and job.get("id")]
     if not olds:
         _forget_watch_job(deps)
-        return dumps({"ok": True, "moved": False, "message": "klipper-print-watch is not scheduled. No cron job was found. Watch state and snapshots were left in place."})
+        script_err = remove_watch_script()
+        if script_err:
+            return fail("no_cron", script_err, "The job was already absent. Watch state was left in place.")
+        return dumps({
+            "ok": True,
+            "moved": False,
+            "message": (
+                "klipper-print-watch is not scheduled. No cron job was found. "
+                "The watch script is gone. Watch state and snapshots were left in place."
+            ),
+        })
     removed_ids: list[str] = []
     for old in olds:
         removed = _run_hermes_cron(deps, ["remove", old["id"]])
@@ -1447,9 +1657,19 @@ def unschedule(deps: Deps) -> str:
             )
         removed_ids.append(old["id"])
     _forget_watch_job(deps)
+    script_err = remove_watch_script()
     shown = ", ".join(removed_ids)
+    if script_err:
+        return fail(
+            "no_cron",
+            f"Removed cron job {shown}. {script_err}",
+            "Delete HERMES_HOME/scripts/klipper-print-watch.py if it is still there. Watch state was left in place.",
+        )
     return dumps({
         "ok": True,
         "moved": False,
-        "message": f"Removed cron job {shown}. Watch state and snapshots were kept. `hermes plugins remove` does not do this by itself.",
+        "message": (
+            f"Removed cron job {shown}. The watch script is gone. "
+            "Watch state and snapshots were kept. `hermes plugins remove` does not do this by itself."
+        ),
     })

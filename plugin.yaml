@@ -1,14 +1,15 @@
 name: klipper-print-watch
-version: 0.1.7
+version: 0.2.0
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
+  Each watch run costs 0 tokens, and the unmanned run holds no tools.
   Watch a Klipper printer from Hermes, built on the Moonraker HTTP API.
   Read print state, progress, temperatures and a slicer time estimate.
   Save a webcam still only inside this plugin's data directory, and only
   when the download is complete and within the size cap. A short or
   oversized body is discarded. A path outside that directory is not saved.
-  Pause, resume, and cancel return one pre_tool_call approve line.
+  While a person is in the session, pause, resume, and cancel return one pre_tool_call approve line.
   Hermes shows it and asks before the POST. yolo and approvals off skip
   the prompt. Choosing always adds one command_allowlist line in config.yaml.
   For pause and resume that line covers only the same action at the same
@@ -19,14 +20,21 @@ description: >-
   If it is already that state, nothing is sent.
   While the plugin is enabled, its skill adds one line to the skills index
   of every session, including surfaces where the tools are turned off.
+  schedule writes a script under HERMES_HOME/scripts and creates one cron job
+  that does not call a model. Empty script output sends nothing. Running
+  schedule again switches an existing job to that script. A job made by 0.1.x
+  keeps its model turn until that next schedule, and this version does not
+  narrow other tools on that leftover job. Removing the plugin leaves the
+  script job. Run hermes klipper-print-watch unschedule first, or hermes cron
+  remove after.
   A cron watch can report klippy_shutdown (Klipper itself stopped, printing
   or not), complete, error, paused (only when the previous state was
   printing and Klipper is running), cancelled, and stalled. An unreachable
-  printer is reported once per cause, then daily. Each cron run is at least
-  one model turn. A turn that calls a tool makes two or more model requests
-  (288 runs a day every 5 minutes).
-  The watch does not move the printer. Camera failure checks are off unless you
-  enable them, and even then they do not cancel the print.
+  printer is reported once per cause, then daily.
+  The watch does not move the printer. The scheduled script does not call
+  the vision model. Camera failure checks are off unless you enable them,
+  and even then they run only when klipper_watch itself runs on a cron turn.
+  They do not cancel the print.
 author: TakeshiTGAL
 license: MIT
 homepage: https://github.com/TakeshiTGAL/hermes-plugin-klipper-print-watch
