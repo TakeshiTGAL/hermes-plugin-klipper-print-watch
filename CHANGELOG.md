@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+The Hermes floor is `>=0.21.6` because stable v0.21.4 does not include `cron.execution_identity.current_cron_execution`. `pre_tool_call` already accepts `{"action": "approve"}` in v0.21.4. The published catalog and the parent pin still say `>=0.21.4`.
+
+When `hermes cron list` shows no klipper-print-watch job, unschedule says the job is not scheduled and that no cron job was found. It does not say the job was removed.
+
 ## 0.1.4
 
 Pause, resume, and cancel are refused in cron, `hermes -q`, webhook, and a plugin-host process, including after always. Hermes stores an always line and then skips its own unattended deny, so this plugin refuses the move before the POST. Choosing always still writes one `plugin_rule:klipper_control:` line to `command_allowlist` in `config.yaml`, and that line still matches only the same action at the same Moonraker origin.

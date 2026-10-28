@@ -1377,7 +1377,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets "
             "and may include more than klipper_print_watch. The prompt tells the agent to call klipper_watch only. "
             "Pause, resume, and cancel are refused in that cron session, including after always. "
-            "Each run is at least one model turn, including runs that report nothing; a turn that calls a tool "
+            "Each run is at least one model turn, including runs that report nothing. A turn that calls a tool "
             "makes two or more model requests. Every 5 minutes is 288 runs a day. "
             "Removing this plugin does not remove the job; run unschedule before removing the plugin."
             + (
@@ -1399,7 +1399,7 @@ def unschedule(deps: Deps) -> str:
         return _cron_fail(listed, "hermes cron list failed, so nothing was removed.")
     olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME and job.get("id")]
     if not olds:
-        return dumps({"ok": True, "moved": False, "message": "klipper-print-watch is not scheduled. Watch state and snapshots were left in place."})
+        return dumps({"ok": True, "moved": False, "message": "klipper-print-watch is not scheduled. No cron job was found. Watch state and snapshots were left in place."})
     removed_ids: list[str] = []
     for old in olds:
         removed = _run_hermes_cron(deps, ["remove", old["id"]])

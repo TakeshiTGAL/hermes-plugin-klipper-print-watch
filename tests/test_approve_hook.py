@@ -335,6 +335,37 @@ def test_always_then_cron_context_does_not_post(hermes, tmp_path, monkeypatch):
     assert _print_posts(router) == []
 
 
+def test_always_then_single_query_env_does_not_post(hermes, tmp_path, monkeypatch):
+    from tools.approval import approve_permanent
+    import model_tools
+
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    details = hermes._get_pre_tool_call_directive_details("klipper_control", {"action": "pause"})
+    approve_permanent("plugin_rule:" + details.rule_key)
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    router = _router()
+    called = []
+
+    def execute(*_args, **_kwargs):
+        called.append("handler")
+        control(
+            deps(tmp_path, router, approver=None),
+            {"action": "pause"},
+            session_id="s1",
+            task_id="t1",
+        )
+        return "{}"
+
+    monkeypatch.setattr(model_tools, "_execute_tool", execute)
+    result = model_tools.handle_function_call(
+        "klipper_control", {"action": "pause"}, session_id="s1", task_id="t1",
+    )
+    assert called == []
+    assert "including after always" in str(result)
+    assert _print_posts(router) == []
+
+
 def test_always_then_webhook_context_is_blocked_without_process_env(hermes, monkeypatch):
     from gateway.session_context import reset_session_vars, set_session_vars
     from tools.approval import approve_permanent

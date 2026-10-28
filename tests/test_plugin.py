@@ -559,6 +559,16 @@ def test_unschedule_keeps_the_state_file(tmp_path):
     assert path.read_text(encoding="utf-8") == '{"version": 1}'
 
 
+def test_unschedule_when_nothing_is_listed_does_not_say_removed(tmp_path):
+    jobs = CronCLI(jobs=[])
+    out = json.loads(unschedule(deps(tmp_path, Router(), cron_run=jobs)))
+    assert jobs.removed == []
+    assert out["ok"] is True
+    assert "not scheduled" in out["message"]
+    assert "No cron job was found" in out["message"]
+    assert "Removed" not in out["message"]
+
+
 def test_session_mode_is_not_a_plugin_block(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
     safety._STASH.clear()
