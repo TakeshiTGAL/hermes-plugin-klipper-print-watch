@@ -489,7 +489,7 @@ def test_another_plugins_block_skips_the_handler(hermes, monkeypatch):
 
 
 def test_leftover_watch_cron_blocks_other_tools_and_still_blocks_motion(hermes):
-    """A 0.1.x model turn of this job may call only klipper_watch.
+    """A 0.1.x model turn may call klipper_watch and the tool bridge.
 
     The shipped script job does not enter this hook. Pause, resume, and cancel
     stay blocked on every cron run, including after always. A conversation and
@@ -506,6 +506,18 @@ def test_leftover_watch_cron_blocks_other_tools_and_still_blocks_motion(hermes):
         terminal, _modified = hermes._dispatch_pre_tool_call_hooks(
             "terminal", {"command": "id"}, session_id="s1", task_id="t1",
         )
+        search, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "tool_search", {"query": "klipper printer"}, session_id="s1", task_id="t1",
+        )
+        describe, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "tool_describe", {"name": "klipper_watch"}, session_id="s1", task_id="t1",
+        )
+        bridge, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "tool_call",
+            {"calls": [{"name": "klipper_watch", "arguments": {}}]},
+            session_id="s1",
+            task_id="t1",
+        )
         status = hermes._get_pre_tool_call_directive_details("klipper_status", {})
         watch = hermes._get_pre_tool_call_directive_details("klipper_watch", {})
         control, _modified = hermes._dispatch_pre_tool_call_hooks(
@@ -513,8 +525,11 @@ def test_leftover_watch_cron_blocks_other_tools_and_still_blocks_motion(hermes):
         )
     finally:
         exit_cron_execution(token)
-    assert terminal and "only klipper_watch" in terminal
-    assert status.action == "block" and "only klipper_watch" in status.message
+    assert terminal and "tool_search" in terminal and "tool_call" in terminal
+    assert search is None
+    assert describe is None
+    assert bridge is None
+    assert status.action == "block" and "tool_search" in status.message
     assert watch.action is None
     assert control and "including after always" in control
 
@@ -564,5 +579,139 @@ def test_leftover_watch_cron_blocks_other_tools_and_still_blocks_motion(hermes):
         )
     finally:
         exit_cron_execution(renamed)
-    assert by_id and "only klipper_watch" in by_id
+    assert by_id and "tool_search" in by_id and "tool_call" in by_id
     assert saved_control and "including after always" in saved_control
+
+
+def test_leftover_watch_cron_lets_the_bridge_through_and_blocks_the_inner_tool(hermes):
+    """Own cron: bridge names pass, terminal is blocked, klipper_watch passes.
+
+    handle_function_call peels tool_call before the hook. terminal is not
+    deferred, so that call is refused before the hook and the handler does
+    not run. A deferred tool is hooked under its own name. klipper_watch runs.
+    Another cron job and a conversation still leave terminal alone.
+    """
+    import json
+
+    import model_tools
+    from agent.tool_executor import _parse_tool_call
+    from cron.execution_identity import enter_cron_execution, exit_cron_execution
+    from tools.registry import registry
+
+    def _hook(name, args=None):
+        message, _modified = hermes._dispatch_pre_tool_call_hooks(
+            name, args or {}, session_id="s1", task_id="t1",
+        )
+        return message
+
+    def _enter(job_id: str, name: str):
+        return enter_cron_execution(
+            {"id": job_id, "name": name},
+            "exec-" + job_id,
+            {"source": "builtin"},
+        )
+
+    def _schema(name):
+        return {
+            "name": name,
+            "description": name + " bridge probe.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+    called = []
+
+    def _watch(args, **_kwargs):
+        called.append("klipper_watch")
+        return json.dumps({"ok": True, "tool": "klipper_watch"})
+
+    def _other(args, **_kwargs):
+        called.append("other_plugin_tool")
+        return json.dumps({"ok": True, "tool": "other_plugin_tool"})
+
+    class _Fn:
+        def __init__(self, name, arguments):
+            self.name = name
+            self.arguments = arguments
+
+    class _Call:
+        def __init__(self, name, arguments):
+            self.function = _Fn(name, arguments)
+            self.id = "c1"
+
+    class _Agent:
+        session_id = "s1"
+        enabled_toolsets = None
+        disabled_toolsets = None
+
+    registry.register(
+        name="klipper_watch", toolset="klipper_print_watch",
+        schema=_schema("klipper_watch"), handler=_watch, override=True,
+    )
+    registry.register(
+        name="other_plugin_tool", toolset="other_plugin",
+        schema=_schema("other_plugin_tool"), handler=_other, override=True,
+    )
+    token = _enter("watch-job", "klipper-print-watch")
+    try:
+        assert _hook("tool_call", {"calls": [{"name": "klipper_watch", "arguments": {}}]}) is None
+        assert _hook("tool_search", {"query": "klipper printer"}) is None
+        assert _hook("tool_describe", {"name": "klipper_watch"}) is None
+        terminal = _hook("terminal", {"command": "id"})
+        watch = hermes._get_pre_tool_call_directive_details("klipper_watch", {})
+        assert terminal and "tool_search" in terminal
+        assert watch.action is None
+
+        agent = _Agent()
+        peeled_own = _parse_tool_call(agent, _Call(
+            "tool_call",
+            json.dumps({"calls": [{"name": "klipper_watch", "arguments": {}}]}),
+        ))
+        peeled_other = _parse_tool_call(agent, _Call(
+            "tool_call",
+            json.dumps({"calls": [{"name": "other_plugin_tool", "arguments": {}}]}),
+        ))
+        peeled_terminal = _parse_tool_call(agent, _Call(
+            "tool_call",
+            json.dumps({"calls": [{"name": "terminal", "arguments": {"command": "true"}}]}),
+        ))
+        assert peeled_own.name == "klipper_watch" and peeled_own.scope_block is None
+        assert peeled_other.name == "other_plugin_tool" and peeled_other.scope_block is None
+        assert peeled_terminal.name == "tool_call" and peeled_terminal.scope_block is None
+
+        terminal_result = model_tools.handle_function_call(
+            "tool_call",
+            {"calls": [{"name": "terminal", "arguments": {"command": "true"}}]},
+            session_id="s1",
+            task_id="t1",
+        )
+        other_result = model_tools.handle_function_call(
+            "tool_call",
+            {"calls": [{"name": "other_plugin_tool", "arguments": {}}]},
+            session_id="s1",
+            task_id="t1",
+        )
+        own_result = model_tools.handle_function_call(
+            "tool_call",
+            {"calls": [{"name": "klipper_watch", "arguments": {}}]},
+            session_id="s1",
+            task_id="t1",
+        )
+    finally:
+        exit_cron_execution(token)
+        registry.deregister("klipper_watch")
+        registry.deregister("other_plugin_tool")
+    assert called == ["klipper_watch"]
+    assert "directly-listed" in str(terminal_result)
+    assert "BLOCKED" in str(other_result) and "tool_search" in str(other_result)
+    assert "klipper_watch" in str(own_result)
+
+    other = _enter("note-job", "daily-note")
+    try:
+        left = _hook("terminal", {"command": "id"})
+        left_bridge = _hook("tool_search", {"query": "klipper"})
+    finally:
+        exit_cron_execution(other)
+    assert left is None
+    assert left_bridge is None
+    assert _hook("terminal", {"command": "id"}) is None
+    assert _hook("tool_search", {"query": "klipper"}) is None

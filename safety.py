@@ -1,7 +1,9 @@
 """Move plans and the public pre_tool_call line. Hermes asks the person.
 
 Pause, resume, and cancel return one approve line while a person is in the
-session. A leftover model turn of this watch may call only klipper_watch.
+session. A leftover model turn of this watch may call klipper_watch and the
+tool bridge. A deferred tool named inside tool_call is checked under that
+inner name.
 Another cron job and a conversation leave other tools alone. yolo and
 approvals off are Hermes's gate. cron, hermes -q, webhook, and a
 plugins.isolation host process refuse the move here, including after always,
@@ -33,8 +35,16 @@ UNATTENDED_MOTION = (
     "BLOCKED: pause, resume, and cancel are refused in cron, hermes -q, webhook, "
     "and other unattended sessions, including after always. Nothing was sent."
 )
+_LEFTOVER_PASS = frozenset({
+    "klipper_watch",
+    "tool_search",
+    "tool_describe",
+    "tool_call",
+})
 LEFTOVER_WATCH_BLOCK = (
-    "BLOCKED: this watch cron turn may call only klipper_watch. "
+    "BLOCKED: this watch cron turn may call only klipper_watch, "
+    "tool_search, tool_describe, and tool_call. "
+    "A deferred tool named inside tool_call is checked again under that name. "
     "Other tools stay closed until the next schedule switches that job to the script. "
     "Nothing was sent."
 )
@@ -259,11 +269,13 @@ def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: An
     """Approve one pause, resume, or cancel while a person is here.
 
     The shipped watch is a script and holds no tools. A leftover 0.1.x model
-    turn of this same job may call only klipper_watch. Pause, resume, and
-    cancel are still refused when nobody is here, including after always.
+    turn of this same job may call klipper_watch, tool_search, tool_describe,
+    and tool_call. A deferred tool named inside tool_call is checked under
+    that inner name. Pause, resume, and cancel are still refused when nobody is here,
+    including after always.
     """
     if tool_name != "klipper_control":
-        if leftover_watch_cron() and tool_name != "klipper_watch":
+        if leftover_watch_cron() and tool_name not in _LEFTOVER_PASS:
             return {"action": "block", "message": LEFTOVER_WATCH_BLOCK}
         return None
     # Every writer call in this session and task starts clean. Other rooms keep

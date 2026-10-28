@@ -1512,7 +1512,7 @@ def _schedule_text(
         "interpreter is not passed. "
         "Running schedule again switches an existing job with hermes cron edit --script --no-agent and clears the stored prompt. "
         "A job made by 0.1.x keeps its model turn until the next schedule. "
-        "On that leftover turn, pre_tool_call blocks every tool except klipper_watch. "
+        "On that leftover turn, pre_tool_call allows klipper_watch, tool_search, tool_describe, and tool_call, and blocks every other tool name. A deferred tool named inside tool_call is checked under that inner name. "
         "Pause, resume, and cancel stay refused in cron, hermes -q, webhook, and a plugin-host process, including after always. "
         "The scheduled script does not call the vision model. "
         "Removing this plugin does not remove the job. Run unschedule before removing the plugin."

@@ -594,7 +594,9 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path, monkeypatc
     assert "hermes cron create --no-agent --script" in made["message"]
     assert "0 tokens" in made["message"]
     assert "holds no tools" in made["message"]
-    assert "blocks every tool except klipper_watch" in made["message"]
+    assert "allows klipper_watch, tool_search, tool_describe, and tool_call" in made["message"]
+    assert "deferred tool named inside tool_call is checked under that inner name" in made["message"]
+    assert "blocks every tool except klipper_watch" not in made["message"]
     assert "does not narrow" not in made["message"]
     assert "clears the stored prompt" in made["message"]
     saved = json.loads((tmp_path / "watch_job.json").read_text(encoding="utf-8"))
