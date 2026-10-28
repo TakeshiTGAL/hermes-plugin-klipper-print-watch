@@ -281,6 +281,7 @@ def test_schedule_help_says_the_run_costs_nothing():
     text = (ROOT / "__init__.py").read_text(encoding="utf-8")
     assert "only calls klipper_watch" not in text
     assert "blocks every tool except klipper_watch" not in text
+    assert "Remove the cron job and the watch script" in text
     assert "0 tokens" in text
     assert "holds no tools" in text
 
@@ -487,11 +488,12 @@ def test_another_plugins_block_skips_the_handler(hermes, monkeypatch):
     assert "other plugin" in str(result)
 
 
-def test_watch_cron_does_not_narrow_tools_and_still_blocks_motion(hermes):
-    """The script job holds no tools, so this hook does not block other tools.
+def test_leftover_watch_cron_blocks_other_tools_and_still_blocks_motion(hermes):
+    """A 0.1.x model turn of this job may call only klipper_watch.
 
-    Pause, resume, and cancel stay blocked on every cron run, including after always.
-    A conversation still gets an approve line.
+    The shipped script job does not enter this hook. Pause, resume, and cancel
+    stay blocked on every cron run, including after always. A conversation and
+    a different cron job still leave other tools alone.
     """
     from cron.execution_identity import enter_cron_execution, exit_cron_execution
 
@@ -511,8 +513,8 @@ def test_watch_cron_does_not_narrow_tools_and_still_blocks_motion(hermes):
         )
     finally:
         exit_cron_execution(token)
-    assert terminal is None
-    assert status.action is None
+    assert terminal and "only klipper_watch" in terminal
+    assert status.action == "block" and "only klipper_watch" in status.message
     assert watch.action is None
     assert control and "including after always" in control
 
@@ -543,7 +545,7 @@ def test_watch_cron_does_not_narrow_tools_and_still_blocks_motion(hermes):
     assert chat_control.action == "approve"
 
     folder = Path(os.environ["HERMES_HOME"]) / "plugin-data" / "klipper-print-watch"
-    folder.mkdir(parents=True)
+    folder.mkdir(parents=True, exist_ok=True)
     (folder / "watch_job.json").write_text(
         json.dumps({"job_id": "saved-job", "job_name": "klipper-print-watch"}),
         encoding="utf-8",
@@ -562,5 +564,5 @@ def test_watch_cron_does_not_narrow_tools_and_still_blocks_motion(hermes):
         )
     finally:
         exit_cron_execution(renamed)
-    assert by_id is None
+    assert by_id and "only klipper_watch" in by_id
     assert saved_control and "including after always" in saved_control

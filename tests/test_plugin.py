@@ -556,6 +556,8 @@ class CronCLI:
                 job["deliver"] = flags["deliver"]
             if "script" in flags:
                 job["script"] = flags["script"]
+            if "prompt" in flags:
+                job["prompt"] = flags["prompt"]
             if "no-agent" in bools:
                 job["no_agent"] = True
             self.edited.append(dict(job))
@@ -592,7 +594,9 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path, monkeypatc
     assert "hermes cron create --no-agent --script" in made["message"]
     assert "0 tokens" in made["message"]
     assert "holds no tools" in made["message"]
-    assert "blocks every tool" not in made["message"]
+    assert "blocks every tool except klipper_watch" in made["message"]
+    assert "does not narrow" not in made["message"]
+    assert "clears the stored prompt" in made["message"]
     saved = json.loads((tmp_path / "watch_job.json").read_text(encoding="utf-8"))
     assert saved["job_id"] == made["job_id"]
     assert saved["job_name"] == "klipper-print-watch"
@@ -1139,6 +1143,8 @@ def test_real_deliver_targets_still_schedule(tmp_path, target, monkeypatch):
     edit_argv = next(argv for argv in jobs.argv if "edit" in argv)
     assert "--no-agent" in edit_argv
     assert edit_argv[edit_argv.index("--script") + 1] == "klipper-print-watch.py"
+    assert edit_argv[edit_argv.index("--prompt") + 1] == ""
+    assert jobs.jobs[0]["prompt"] == ""
     assert "interpreter" not in edit_argv
     if target == "telegram":
         assert "still delivers to telegram" in out["message"]

@@ -1,5 +1,5 @@
 name: klipper-print-watch
-version: 0.2.0
+version: 0.2.1
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
@@ -22,9 +22,10 @@ description: >-
   of every session, including surfaces where the tools are turned off.
   schedule writes a script under HERMES_HOME/scripts and creates one cron job
   that does not call a model. Empty script output sends nothing. Running
-  schedule again switches an existing job to that script. A job made by 0.1.x
-  keeps its model turn until that next schedule, and this version does not
-  narrow other tools on that leftover job. Removing the plugin leaves the
+  schedule again switches an existing job to that script and clears the stored
+  prompt. A job made by 0.1.x keeps its model turn until that next schedule.
+  On that leftover turn, pre_tool_call blocks every tool except klipper_watch.
+  Removing the plugin leaves the
   script job. Run hermes klipper-print-watch unschedule first, or hermes cron
   remove after.
   A cron watch can report klippy_shutdown (Klipper itself stopped, printing

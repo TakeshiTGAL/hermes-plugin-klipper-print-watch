@@ -1510,9 +1510,9 @@ def _schedule_text(
         "The job runs a script and does not call a model. Empty script output sends nothing. "
         "hermes cron create cannot set a per-job tool list, which does not matter here because this job holds no tools. "
         "interpreter is not passed. "
-        "Running schedule again switches an existing job with hermes cron edit --script --no-agent. "
+        "Running schedule again switches an existing job with hermes cron edit --script --no-agent and clears the stored prompt. "
         "A job made by 0.1.x keeps its model turn until the next schedule. "
-        "This version does not narrow other tools on that leftover job. "
+        "On that leftover turn, pre_tool_call blocks every tool except klipper_watch. "
         "Pause, resume, and cancel stay refused in cron, hermes -q, webhook, and a plugin-host process, including after always. "
         "The scheduled script does not call the vision model. "
         "Removing this plugin does not remove the job. Run unschedule before removing the plugin."
@@ -1579,6 +1579,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         edited = _run_hermes_cron(deps, [
             "edit", job_id, "--schedule", when, "--deliver", target,
             "--script", SCRIPT_NAME, "--no-agent",
+            "--prompt", "",
         ])
         if edited.returncode != 0:
             return _cron_fail(edited, "hermes cron edit failed, so the existing job was not changed.")

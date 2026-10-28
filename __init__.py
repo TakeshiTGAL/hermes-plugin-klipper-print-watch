@@ -205,7 +205,10 @@ def register(ctx) -> None:
         )
         p.add_argument("--deliver", default="", help="telegram, discord, slack, local, or platform:chat_id. Required.")
         p.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="Cron expression. No faster than every 2 minutes.")
-        subs.add_parser("unschedule", help="Remove the cron job. Keeps watch state and snapshots.")
+        subs.add_parser(
+            "unschedule",
+            help="Remove the cron job and the watch script. Keeps watch state and snapshots.",
+        )
 
     def _cli(args) -> None:
         cmd = getattr(args, "klipper_command", None) or "status"

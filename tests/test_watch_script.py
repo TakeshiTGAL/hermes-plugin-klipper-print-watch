@@ -96,6 +96,7 @@ def _python_with_hermes() -> str | None:
         [sys.executable, "-c", "import hermes_constants"],
         capture_output=True,
         text=True,
+        timeout=30,
     )
     if done.returncode == 0:
         return sys.executable
@@ -116,14 +117,14 @@ def test_script_stdout_is_empty_or_the_watch_text(tmp_path, monkeypatch):
     env = os.environ.copy()
     env["HERMES_HOME"] = str(home)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    quiet = subprocess.run([python, str(script)], capture_output=True, text=True, env=env)
+    quiet = subprocess.run([python, str(script)], capture_output=True, text=True, env=env, timeout=30)
     assert quiet.returncode == 0, quiet.stderr
     assert quiet.stdout == ""
     (plugin / "service.py").write_text("def watch_stdout():\n    return 'hello stop'\n", encoding="utf-8")
-    loud = subprocess.run([python, str(script)], capture_output=True, text=True, env=env)
+    loud = subprocess.run([python, str(script)], capture_output=True, text=True, env=env, timeout=30)
     assert loud.returncode == 0, loud.stderr
     assert loud.stdout == "hello stop\n"
     (plugin / "service.py").unlink()
-    missing = subprocess.run([python, str(script)], capture_output=True, text=True, env=env)
+    missing = subprocess.run([python, str(script)], capture_output=True, text=True, env=env, timeout=30)
     assert missing.returncode != 0
     assert missing.stdout == ""

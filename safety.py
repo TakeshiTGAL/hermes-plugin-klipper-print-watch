@@ -1,9 +1,11 @@
 """Move plans and the public pre_tool_call line. Hermes asks the person.
 
-Pause, resume, and cancel return one approve line. Reads and the watch
-return nothing. yolo and approvals off are Hermes's gate. cron, hermes -q,
-webhook, and a plugins.isolation host process refuse the move here, including
-after always, because Hermes checks a saved always line before that deny.
+Pause, resume, and cancel return one approve line while a person is in the
+session. A leftover model turn of this watch may call only klipper_watch.
+Another cron job and a conversation leave other tools alone. yolo and
+approvals off are Hermes's gate. cron, hermes -q, webhook, and a
+plugins.isolation host process refuse the move here, including after always,
+because Hermes checks a saved always line before that deny.
 """
 from __future__ import annotations
 
@@ -30,6 +32,11 @@ _UNATTENDED_PLATFORMS = frozenset({"webhook", "msgraph_webhook", "api_server"})
 UNATTENDED_MOTION = (
     "BLOCKED: pause, resume, and cancel are refused in cron, hermes -q, webhook, "
     "and other unattended sessions, including after always. Nothing was sent."
+)
+LEFTOVER_WATCH_BLOCK = (
+    "BLOCKED: this watch cron turn may call only klipper_watch. "
+    "Other tools stay closed until the next schedule switches that job to the script. "
+    "Nothing was sent."
 )
 
 
@@ -68,6 +75,52 @@ def _current_cron():
 def cron_mark_active() -> bool:
     """True when the public cron execution mark is bound. Import failure is not cron."""
     return _current_cron() is not None
+
+
+def _saved_watch_job_id() -> str:
+    """Job id written by schedule, or empty when the file is missing or unreadable.
+
+    Reads the file only. It does not create the plugin data directory. With no
+    HERMES_HOME and no context-local home, it does not fall back to ~/.hermes.
+    """
+    try:
+        from hermes_constants import get_hermes_home, get_hermes_home_override
+        if not get_hermes_home_override() and not os.environ.get("HERMES_HOME", "").strip():
+            return ""
+        path = Path(get_hermes_home()) / "plugin-data" / PLUGIN_NAME / WATCH_JOB_FILE
+    except Exception:
+        home = os.environ.get("HERMES_HOME", "").strip()
+        if not home:
+            return ""
+        path = Path(home) / "plugin-data" / PLUGIN_NAME / WATCH_JOB_FILE
+    if not path.is_file():
+        return ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    job_id = raw.get("job_id")
+    if not isinstance(job_id, str):
+        return ""
+    return job_id.strip()
+
+
+def leftover_watch_cron() -> bool:
+    """True on a model turn of this watch, including a 0.1.x job not switched yet.
+
+    The shipped script job does not enter this hook. A match is the job name
+    ``klipper-print-watch`` or the id saved under the plugin data directory.
+    """
+    current = _current_cron()
+    if current is None:
+        return False
+    if str(getattr(current, "job_name", "") or "") == WATCH_JOB_NAME:
+        return True
+    job_id = str(getattr(current, "job_id", "") or "")
+    saved = _saved_watch_job_id()
+    return bool(job_id) and job_id == saved
 
 
 def motion_is_unattended() -> bool:
@@ -205,11 +258,13 @@ def take_move(payload: dict, ids: tuple[str, str], plan: tuple[str, str, str]) -
 def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: Any):
     """Approve one pause, resume, or cancel while a person is here.
 
-    The scheduled watch is a script and holds no tools, so this hook does not
-    narrow other tools. Pause, resume, and cancel are still refused when nobody
-    is here, including after always. Reads and the watch stay silent.
+    The shipped watch is a script and holds no tools. A leftover 0.1.x model
+    turn of this same job may call only klipper_watch. Pause, resume, and
+    cancel are still refused when nobody is here, including after always.
     """
     if tool_name != "klipper_control":
+        if leftover_watch_cron() and tool_name != "klipper_watch":
+            return {"action": "block", "message": LEFTOVER_WATCH_BLOCK}
         return None
     # Every writer call in this session and task starts clean. Other rooms keep
     # their own previews while they wait for an answer.
