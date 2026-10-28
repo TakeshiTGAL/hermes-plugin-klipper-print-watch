@@ -543,6 +543,11 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path, monkeypatc
     assert "not sent to a chat" in made["message"]
     assert "hermes cron create" in made["message"]
     assert "cannot set enabled_toolsets" in made["message"]
+    assert "may include more than klipper_print_watch" in made["message"]
+    assert "blocks every tool except klipper_watch" in made["message"]
+    saved = json.loads((tmp_path / "watch_job.json").read_text(encoding="utf-8"))
+    assert saved["job_id"] == made["job_id"]
+    assert saved["job_name"] == "klipper-print-watch"
     for expr in ("2m", "every 2m", "every 5m", "in 30m", "*/2 * * * *", "0 0 * * * *"):
         slow = json.loads(schedule(deps(tmp_path, Router(), cron_run=jobs), expr, "telegram"))
         assert slow["ok"] is True, expr
@@ -552,14 +557,17 @@ def test_schedule_requires_a_target_and_refuses_a_fast_cron(tmp_path, monkeypatc
 def test_unschedule_keeps_the_state_file(tmp_path):
     path = tmp_path / "watch_state.json"
     path.write_text('{"version": 1}', encoding="utf-8")
+    (tmp_path / "watch_job.json").write_text('{"job_id": "job1"}', encoding="utf-8")
     jobs = CronCLI(jobs=[{"name": "klipper-print-watch", "id": "job1", "deliver": "local"}])
     out = json.loads(unschedule(deps(tmp_path, Router(), cron_run=jobs)))
     assert jobs.removed == ["job1"]
     assert out["ok"] is True
     assert path.read_text(encoding="utf-8") == '{"version": 1}'
+    assert not (tmp_path / "watch_job.json").exists()
 
 
 def test_unschedule_when_nothing_is_listed_does_not_say_removed(tmp_path):
+    (tmp_path / "watch_job.json").write_text('{"job_id": "gone"}', encoding="utf-8")
     jobs = CronCLI(jobs=[])
     out = json.loads(unschedule(deps(tmp_path, Router(), cron_run=jobs)))
     assert jobs.removed == []
@@ -567,6 +575,34 @@ def test_unschedule_when_nothing_is_listed_does_not_say_removed(tmp_path):
     assert "not scheduled" in out["message"]
     assert "No cron job was found" in out["message"]
     assert "Removed" not in out["message"]
+    assert not (tmp_path / "watch_job.json").exists()
+
+
+def test_hermes_cron_child_stops_after_60_seconds(tmp_path, monkeypatch):
+    import subprocess
+
+    seen = {}
+
+    def fake_run(argv, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        class Done:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return Done()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    from service import _run_hermes_cron
+    _run_hermes_cron(deps(tmp_path, Router()), ["list", "--all"])
+    assert seen["timeout"] == 60
+
+    def expire(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(subprocess, "run", expire)
+    done = _run_hermes_cron(deps(tmp_path, Router()), ["list", "--all"])
+    assert done.returncode == 124
+    assert "timed out" in done.stderr
 
 
 def test_session_mode_is_not_a_plugin_block(tmp_path, monkeypatch):

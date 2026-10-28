@@ -196,7 +196,13 @@ def register(ctx) -> None:
         subs.add_parser("watch", help="Compare with the previous sample. Does not move the printer.")
         p = subs.add_parser(
             "schedule",
-            help="Create a Hermes cron job that only calls klipper_watch. Each run is at least one model turn.",
+            help=(
+                "Create a Hermes cron job named klipper-print-watch. "
+                "hermes cron create cannot set enabled_toolsets, so the job uses this profile's "
+                "cron platform toolsets and may include more than klipper_print_watch. "
+                "On that job, pre_tool_call blocks every tool except klipper_watch. "
+                "Each run is at least one model turn."
+            ),
         )
         p.add_argument("--deliver", default="", help="telegram, discord, slack, local, or platform:chat_id. Required.")
         p.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="Cron expression. No faster than every 2 minutes.")

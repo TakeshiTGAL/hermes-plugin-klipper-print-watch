@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+`hermes klipper-print-watch schedule --help` no longer says the cron job only calls `klipper_watch`. `hermes cron create` still cannot set `enabled_toolsets`, so the job uses the profile's cron platform toolsets and can include more than `klipper_print_watch`. On a run whose job id matches the id saved under the plugin data directory, or whose job name is `klipper-print-watch`, `pre_tool_call` blocks every tool except `klipper_watch`. Another cron job and a conversation return nothing from this hook. The `hermes cron` child process stops after 60 seconds.
+
 ## 0.1.6
 
 Cancel cannot be resumed, so each cancel uses a new `rule_key`. Choosing always still writes one `plugin_rule:klipper_control:` line to `command_allowlist` in `config.yaml`. That line does not approve the next cancel. Hermes asks again. Pause and resume still reuse one key per action and origin while a person is in the session. cron, `hermes -q`, webhook, and a plugin-host process still refuse every move, including after always.

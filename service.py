@@ -30,6 +30,8 @@ if __package__:
         reason_fits,
         take_move,
         write_guard_error,
+        WATCH_JOB_FILE,
+        WATCH_JOB_NAME,
     )
     from . import watch as watch_state
 else:
@@ -49,11 +51,14 @@ else:
         reason_fits,
         take_move,
         write_guard_error,
+        WATCH_JOB_FILE,
+        WATCH_JOB_NAME,
     )
     import watch as watch_state
 
 TOOLSET = "klipper_print_watch"
-JOB_NAME = "klipper-print-watch"
+JOB_NAME = WATCH_JOB_NAME
+CRON_CHILD_TIMEOUT_SECONDS = 60
 VISION_MAX_TOKENS = 200
 VISION_TIMEOUT_SECONDS = 30.0
 SNAPSHOT_KEEP = 20
@@ -1118,9 +1123,13 @@ def _run_hermes_cron(deps: Deps, args: list[str]) -> _Cmd:
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, env=env)
+        done = subprocess.run(
+            argv, capture_output=True, text=True, env=env, timeout=CRON_CHILD_TIMEOUT_SECONDS,
+        )
     except OSError as exc:
         return _Cmd(127, "", f"Could not run hermes ({type(exc).__name__}).")
+    except subprocess.TimeoutExpired:
+        return _Cmd(124, "", "hermes cron timed out.")
     return _Cmd(int(done.returncode), done.stdout or "", done.stderr or "")
 
 
@@ -1275,6 +1284,25 @@ def slash_schedule_args(parts: list[str], default: str = DEFAULT_SCHEDULE) -> tu
     return when, deliver
 
 
+def _remember_watch_job(deps: Deps, job_id: str) -> None:
+    """Save the job id next to the watch state. A failed write still leaves the name match."""
+    if deps.data_dir is None or not job_id:
+        return
+    _write_json(deps, deps.data_dir / WATCH_JOB_FILE, {"job_id": job_id, "job_name": JOB_NAME})
+
+
+def _forget_watch_job(deps: Deps) -> None:
+    if deps.data_dir is None:
+        return
+    path = deps.data_dir / WATCH_JOB_FILE
+    if _guard(deps, str(path)):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
     if in_plugin_host_process():
         return fail(
@@ -1331,6 +1359,7 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "Run hermes cron list and remove any half-created klipper-print-watch job before trying again.",
         )
     created = {"id": created_id, "schedule_display": when}
+    _remember_watch_job(deps, created_id)
     leftover = ""
     for previous in olds:
         if not previous.get("id") or previous["id"] == created_id:
@@ -1346,7 +1375,10 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             "message": (
                 f"Scheduled new job {created_id} with hermes cron create, but the previous job {leftover} "
                 "is still there. Remove that previous job before relying on the new one. Watch state was not deleted. "
-                "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets. "
+                "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets "
+                "and may include more than klipper_print_watch. "
+                "On a run of this job, pre_tool_call blocks every tool except klipper_watch. "
+                "Another cron job and a conversation return nothing from this hook. "
                 "Pause, resume, and cancel stay refused in that cron session, including after always."
             ),
             "job_id": created_id,
@@ -1375,7 +1407,10 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
             f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}) with hermes cron create. "
             f"Results are {where}{replaced} "
             "hermes cron create cannot set enabled_toolsets, so the job uses this profile's cron platform toolsets "
-            "and may include more than klipper_print_watch. The prompt tells the agent to call klipper_watch only. "
+            "and may include more than klipper_print_watch. "
+            "On a run of this job, pre_tool_call blocks every tool except klipper_watch. "
+            "Another cron job and a conversation return nothing from this hook. "
+            "The prompt tells the agent to call klipper_watch only. "
             "Pause, resume, and cancel are refused in that cron session, including after always. "
             "Each run is at least one model turn, including runs that report nothing. A turn that calls a tool "
             "makes two or more model requests. Every 5 minutes is 288 runs a day. "
@@ -1399,6 +1434,7 @@ def unschedule(deps: Deps) -> str:
         return _cron_fail(listed, "hermes cron list failed, so nothing was removed.")
     olds = [job for job in _parse_listed_jobs(listed.stdout) if job.get("name") == JOB_NAME and job.get("id")]
     if not olds:
+        _forget_watch_job(deps)
         return dumps({"ok": True, "moved": False, "message": "klipper-print-watch is not scheduled. No cron job was found. Watch state and snapshots were left in place."})
     removed_ids: list[str] = []
     for old in olds:
@@ -1410,6 +1446,7 @@ def unschedule(deps: Deps) -> str:
                 "Remove the klipper-print-watch job with hermes cron remove, then run unschedule again if it is still there.",
             )
         removed_ids.append(old["id"])
+    _forget_watch_job(deps)
     shown = ", ".join(removed_ids)
     return dumps({
         "ok": True,

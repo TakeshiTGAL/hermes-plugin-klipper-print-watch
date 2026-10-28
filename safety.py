@@ -19,7 +19,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 PLUGIN_NAME = "klipper-print-watch"
+WATCH_JOB_NAME = "klipper-print-watch"
+WATCH_JOB_FILE = "watch_job.json"
 ACTIONS = ("pause", "resume", "cancel")
+WATCH_ONLY = (
+    "BLOCKED: this cron run is the klipper-print-watch job. "
+    "Only klipper_watch may run. Other tools are blocked before they run."
+)
 HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
 REASON_BUDGET = 300
 ENDPOINTS = {action: f"POST /printer/print/{action}" for action in ACTIONS}
@@ -51,16 +57,53 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
-def cron_mark_active() -> bool:
-    """True when the public cron execution mark is bound. Import failure is not cron."""
+def _current_cron():
+    """Public cron mark, or None when it is missing or cannot be read. Import failure is not cron."""
     try:
         from cron.execution_identity import current_cron_execution
     except Exception:
-        return False
+        return None
     try:
-        return current_cron_execution() is not None
+        return current_cron_execution()
     except Exception:
+        return None
+
+
+def cron_mark_active() -> bool:
+    """True when the public cron execution mark is bound. Import failure is not cron."""
+    return _current_cron() is not None
+
+
+def _saved_watch_job_id() -> str:
+    """Job id written at schedule time. A missing file is not a match."""
+    try:
+        from hermes_constants import get_hermes_home
+        path = get_hermes_home() / "plugin-data" / PLUGIN_NAME / WATCH_JOB_FILE
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    job_id = raw.get("job_id")
+    return job_id if isinstance(job_id, str) else ""
+
+
+def our_watch_cron() -> bool:
+    """True only for the cron job this plugin created.
+
+    The public mark's job id matches the id saved under the plugin data directory,
+    or its job name is klipper-print-watch. A chat has no mark. Another cron job
+    has a different id and a different name. Both leave every other tool call untouched.
+    """
+    current = _current_cron()
+    if current is None:
         return False
+    job_id = str(getattr(current, "job_id", "") or "")
+    job_name = str(getattr(current, "job_name", "") or "")
+    saved_id = _saved_watch_job_id()
+    if saved_id and job_id == saved_id:
+        return True
+    return job_name == WATCH_JOB_NAME
 
 
 def motion_is_unattended() -> bool:
@@ -196,7 +239,14 @@ def take_move(payload: dict, ids: tuple[str, str], plan: tuple[str, str, str]) -
 
 
 def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: Any):
-    """Approve one pause, resume, or cancel. Reads and the watch stay silent."""
+    """Approve one pause, resume, or cancel. Reads and the watch stay silent.
+
+    On this plugin's own watch cron job, every tool except klipper_watch is blocked.
+    klipper_control still falls through to the unattended refusal below.
+    Any other cron job, and any chat, keeps the previous return for that tool.
+    """
+    if our_watch_cron() and tool_name not in {"klipper_watch", "klipper_control"}:
+        return {"action": "block", "message": WATCH_ONLY}
     if tool_name != "klipper_control":
         return None
     # Every writer call in this session and task starts clean. Other rooms keep

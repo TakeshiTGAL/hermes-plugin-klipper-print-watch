@@ -1,5 +1,5 @@
 name: klipper-print-watch
-version: 0.1.6
+version: 0.1.7
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
