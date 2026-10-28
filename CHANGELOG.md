@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6
+
+Cancel cannot be resumed, so each cancel uses a new `rule_key`. Choosing always still writes one `plugin_rule:klipper_control:` line to `command_allowlist` in `config.yaml`. That line does not approve the next cancel. Hermes asks again. Pause and resume still reuse one key per action and origin while a person is in the session. cron, `hermes -q`, webhook, and a plugin-host process still refuse every move, including after always.
+
 ## 0.1.5
 
 The Hermes floor is `>=0.21.6` because stable v0.21.4 does not include `cron.execution_identity.current_cron_execution`. `pre_tool_call` already accepts `{"action": "approve"}` in v0.21.4. The published catalog and the parent pin still say `>=0.21.4`.

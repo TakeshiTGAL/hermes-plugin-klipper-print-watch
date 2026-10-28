@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -107,18 +108,31 @@ def motion_block_reason(action: str) -> str | None:
 
 def approval_text(action: str, origin: str) -> str:
     """What the person is asked to approve: the device, the call, and its argument."""
-    return (
+    base = (
         f"Move the Klipper printer at {origin or '(MOONRAKER_URL not set)'}: "
         f"send {ENDPOINTS[action]} (action={action}) to Moonraker. "
         "This pauses, resumes, or cancels a physical print. "
-        + ("Cancel ends the print; it cannot be resumed afterwards. " if action == "cancel" else "")
-        + "always is only this action at this origin, not cron, -q, or webhook."
     )
+    if action == "cancel":
+        return (
+            base
+            + "Cancel ends the print and cannot be resumed afterwards. "
+            + "Each cancel asks again. always does not cover the next cancel."
+        )
+    return base + "always is only this action at this origin, not cron, -q, or webhook."
 
 
 def one_call_rule_key(action: str, origin: str) -> str:
-    """Hermes stores session and always under this key. The same plan matches; another does not."""
-    body = json.dumps({"action": action, "origin": origin}, sort_keys=True, separators=(",", ":"))
+    """Hermes stores session and always under this exact key.
+
+    Pause and resume keep one key per action and origin. Cancel cannot be
+    resumed, so each call mixes in a new nonce. A saved always line does not
+    match the next cancel, including after this process starts again.
+    """
+    fields = {"action": action, "origin": origin}
+    if action == "cancel":
+        fields["nonce"] = uuid.uuid4().hex
+    body = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return "klipper_control:" + hashlib.sha256(body.encode()).hexdigest()[:16]
 
 

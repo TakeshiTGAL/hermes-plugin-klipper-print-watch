@@ -1,5 +1,5 @@
 name: klipper-print-watch
-version: 0.1.5
+version: 0.1.6
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
@@ -11,8 +11,10 @@ description: >-
   Pause, resume, and cancel return one pre_tool_call approve line.
   Hermes shows it and asks before the POST. yolo and approvals off skip
   the prompt. Choosing always adds one command_allowlist line in config.yaml.
-  That line covers only the same action at the same Moonraker origin, and
-  only while a person is in the session. cron, hermes -q, webhook, and a
+  For pause and resume that line covers only the same action at the same
+  Moonraker origin, and only while a person is in the session. Cancel asks
+  every time. Its rule_key changes on each call, so a saved always line does
+  not approve the next cancel. cron, hermes -q, webhook, and a
   plugins.isolation host process still refuse the move, including after always.
   If it is already that state, nothing is sent.
   While the plugin is enabled, its skill adds one line to the skills index
@@ -66,7 +68,7 @@ config_schema:
       Off by default. When true, each klipper_watch tick saves one webcam still
       and makes one ctx.llm image call. failed and not_failed are recorded only
       when the model says so. If it cannot tell, the reply says so and names the
-      still and the time; that is not a pass. Nothing here pauses or cancels.
+      still and the time. That is not a pass. Nothing here pauses or cancels.
       The printer moves only through klipper_control after approval.
   snapshot_max_bytes:
     type: int

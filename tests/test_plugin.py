@@ -1067,8 +1067,25 @@ def test_control_timeout_says_the_command_may_still_arrive(tmp_path):
 
 
 def test_cancel_approval_text_says_it_cannot_be_resumed():
-    assert "cannot be resumed" in safety.approval_text("cancel", "http://printer.local:7125")
-    assert "cannot be resumed" not in safety.approval_text("pause", "http://printer.local:7125")
+    cancel = safety.approval_text("cancel", "http://printer.local:7125")
+    pause = safety.approval_text("pause", "http://printer.local:7125")
+    assert "cannot be resumed" in cancel
+    assert "does not cover the next cancel" in cancel
+    assert "cannot be resumed" not in pause
+    assert "always is only this action" in pause
+    assert safety.reason_fits(cancel)
+    assert ";" not in cancel and ";" not in pause
+
+
+def test_cancel_rule_key_changes_every_call_and_pause_stays():
+    origin = "http://printer.local:7125"
+    assert safety.one_call_rule_key("pause", origin) == safety.one_call_rule_key("pause", origin)
+    assert safety.one_call_rule_key("resume", origin) == safety.one_call_rule_key("resume", origin)
+    first = safety.one_call_rule_key("cancel", origin)
+    second = safety.one_call_rule_key("cancel", origin)
+    assert first != second
+    assert first.startswith("klipper_control:")
+    assert len(first) == len("klipper_control:") + 16
 
 
 def test_control_disconnect_after_post_says_the_command_may_still_arrive(tmp_path):

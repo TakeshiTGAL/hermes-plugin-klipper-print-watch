@@ -395,6 +395,36 @@ def test_always_does_not_cover_another_action(hermes):
     assert blocked and "BLOCKED" in blocked
 
 
+def test_always_on_cancel_does_not_approve_the_next_cancel(hermes, tmp_path, monkeypatch):
+    from tools.approval import approve_permanent
+    import model_tools
+
+    first = hermes._get_pre_tool_call_directive_details("klipper_control", {"action": "cancel"})
+    again = hermes._get_pre_tool_call_directive_details("klipper_control", {"action": "cancel"})
+    assert first.rule_key != again.rule_key
+    approve_permanent("plugin_rule:" + first.rule_key)
+    router = _router()
+    router.add("/printer/print/cancel", 200, ok_result("ok"))
+    called = []
+
+    def execute(*_args, **_kwargs):
+        called.append("handler")
+        return control(
+            deps(tmp_path, router, approver=None),
+            {"action": "cancel"},
+            session_id="s1",
+            task_id="t1",
+        )
+
+    monkeypatch.setattr(model_tools, "_execute_tool", execute)
+    result = model_tools.handle_function_call(
+        "klipper_control", {"action": "cancel"}, session_id="s1", task_id="t1",
+    )
+    assert called == []
+    assert "BLOCKED" in str(result)
+    assert _print_posts(router) == []
+
+
 def test_yolo_lets_hermes_skip_the_prompt_and_post(hermes, tmp_path, monkeypatch):
     import model_tools
     import tools.approval as approval
